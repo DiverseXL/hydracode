@@ -1,0 +1,452 @@
+/**
+ * TypeScript extraction using the compiler API (ts.createProgram — no
+ * ts-morph or other wrappers, to keep dependencies minimal).
+ *
+ * Pure extraction: returns in-memory data shaped like graph/schema.ts. No
+ * HydraDB calls happen here; call resolution happens in the writer's
+ * graph-linking step, not here.
+ *
+ * KNOWN LIMITATIONS (deliberate for MVP):
+ * - Anonymous functions with no assignable name (inline callbacks, IIFEs,
+ *   object-literal method shorthand) are skipped — no synthesized names.
+ * - `extends` is captured only for a plain Identifier parent (`class Foo
+ *   extends Bar`); complex expressions (mixins, `extends getBase()`) are
+ *   skipped.
+ * - Tests: only leaf cases with a string-literal name (`it`/`test`/`it.only`
+ *   /`it.skip`/`test.only`/`test.skip`). Nested describe context is NOT
+ *   captured in the test name.
+ * - Call edges: only plain-Identifier callees (`foo()`) and `this.foo()`
+ *   are captured. Method calls on other objects (`obj.method()`) and
+ *   computed calls are skipped — this under-counts real call edges,
+ *   especially cross-object method calls.
+ * - Re-exports (`export ... from`) and dynamic `import()` are not tracked.
+ * - .gitignore is not parsed yet; extraction uses hardcoded excludes
+ *   (node_modules, dist, .git, .hydracode).
+ * - One compiler program is created per file (simple, correct; could be
+ *   batched into a single program for large repos later).
+ */
+
+import path from "node:path";
+import fg from "fast-glob";
+import ora from "ora";
+import ts from "typescript";
+import type {
+  ClassNode,
+  FileNode,
+  FunctionNode,
+  Language,
+  TestNode,
+} from "../graph/schema.js";
+
+export interface ExtractedImport {
+  modulePath: string;
+  isExternal: boolean;
+  /** For relative imports: how the module path was resolved. */
+  resolvedBy?: "compiler" | "fallback";
+}
+
+export interface ExtractedCall {
+  callerId: string;
+  calleeName: string;
+  /** "identifier" for plain foo() calls; "this" for this.foo() calls. */
+  kind?: "identifier" | "this";
+}
+
+export interface ExtractedMethodOf {
+  functionId: string;
+  classId: string;
+}
+
+export interface ExtractedExtends {
+  classId: string;
+  parentClassName: string;
+}
+
+export interface ExtractedFile {
+  file: FileNode;
+  functions: FunctionNode[];
+  classes: ClassNode[];
+  tests: TestNode[];
+  imports: ExtractedImport[];
+  /** Unresolved callee name; resolution happens in the writer, not here. */
+  calls: ExtractedCall[];
+  methodOf: ExtractedMethodOf[];
+  /** Unresolved parent name; same reasoning as calls. */
+  extends: ExtractedExtends[];
+}
+
+const DEFAULT_PATTERNS = ["**/*.{ts,tsx,js,jsx}"];
+
+/** Hardcoded excludes — .gitignore parsing is not implemented yet. */
+const EXCLUDE_PATTERNS = [
+  "**/node_modules/**",
+  "**/dist/**",
+  "**/.git/**",
+  "**/.hydracode/**",
+];
+
+export async function extractFile(
+  filePath: string,
+  repoRoot: string,
+): Promise<ExtractedFile> {
+  const filePathAbs = path.resolve(repoRoot, filePath);
+  const relPath = repoRelative(repoRoot, filePathAbs);
+
+  const program = ts.createProgram([filePathAbs], {
+    allowJs: true,
+    checkJs: false,
+    skipLibCheck: true,
+    module: ts.ModuleKind.NodeNext,
+    moduleResolution: ts.ModuleResolutionKind.NodeNext,
+    target: ts.ScriptTarget.ES2022,
+  });
+
+  // Force the binder to run so the AST has parent/sourceFile links (needed
+  // by node.parent lookups and getStart()). Without this, files returned by
+  // getSourceFile are parsed but not bound, and getStart() crashes.
+  program.getTypeChecker();
+
+  const sourceFile = program.getSourceFile(filePathAbs);
+  if (!sourceFile) {
+    throw new Error(`extractFile: could not load source file ${filePathAbs}`);
+  }
+
+  const functions: FunctionNode[] = [];
+  const classes: ClassNode[] = [];
+  const tests: TestNode[] = [];
+  const imports: ExtractedImport[] = [];
+  const calls: ExtractedCall[] = [];
+  const methodOf: ExtractedMethodOf[] = [];
+  const extendsList: ExtractedExtends[] = [];
+
+  // Stack of enclosing function ids; innermost is the caller of any call.
+  const funcStack: string[] = [];
+
+  const lineAt = (pos: number): number =>
+    sourceFile.getLineAndCharacterOfPosition(pos).line + 1;
+
+  const isExported = (node: ts.HasModifiers): boolean =>
+    ts.getModifiers(node)?.some(
+      (m) => m.kind === ts.SyntaxKind.ExportKeyword,
+    ) ?? false;
+
+  const isAsync = (node: ts.HasModifiers): boolean =>
+    ts.getModifiers(node)?.some(
+      (m) => m.kind === ts.SyntaxKind.AsyncKeyword,
+    ) ?? false;
+
+  const classIdOf = (className: string): string => `${relPath}#${className}`;
+
+  const pushFunction = (f: {
+    name: string;
+    qualifiedName: string;
+    exported: boolean;
+    async: boolean;
+    startLine: number;
+    endLine: number;
+  }): string => {
+    const id = `${relPath}#${f.qualifiedName}#${f.startLine}`;
+    functions.push({ id, ...f });
+    return id;
+  };
+
+  const findEnclosingClass = (
+    node: ts.Node,
+  ): ts.ClassDeclaration | undefined => {
+    let cur = node.parent;
+    while (cur) {
+      if (ts.isClassDeclaration(cur)) return cur;
+      cur = cur.parent;
+    }
+    return undefined;
+  };
+
+  const methodName = (method: ts.MethodDeclaration): string | undefined => {
+    const name = method.name;
+    if (ts.isIdentifier(name)) return name.text;
+    if (ts.isStringLiteral(name)) return name.text;
+    return undefined; // computed method names: skip
+  };
+
+  const visit = (node: ts.Node): void => {
+    let frameId: string | undefined;
+
+    if (ts.isFunctionDeclaration(node) && node.name) {
+      frameId = pushFunction({
+        name: node.name.text,
+        qualifiedName: node.name.text,
+        exported: isExported(node),
+        async: isAsync(node),
+        startLine: lineAt(node.getStart()),
+        endLine: lineAt(node.getEnd()),
+      });
+    } else if (ts.isMethodDeclaration(node)) {
+      const classDecl = findEnclosingClass(node);
+      const name = classDecl?.name ? methodName(node) : undefined;
+      if (classDecl?.name && name) {
+        frameId = pushFunction({
+          name,
+          qualifiedName: `${classDecl.name.text}.${name}`,
+          exported: isExported(node),
+          async: isAsync(node),
+          startLine: lineAt(node.getStart()),
+          endLine: lineAt(node.getEnd()),
+        });
+        methodOf.push({
+          functionId: frameId,
+          classId: classIdOf(classDecl.name.text),
+        });
+      }
+    } else if (ts.isVariableDeclaration(node)) {
+      // const foo = function () {} | const foo = () => {}
+      const init = node.initializer;
+      if (
+        node.name &&
+        ts.isIdentifier(node.name) &&
+        init &&
+        (ts.isFunctionExpression(init) || ts.isArrowFunction(init))
+      ) {
+        const statement = node.parent.parent;
+        frameId = pushFunction({
+          name: node.name.text,
+          qualifiedName: node.name.text,
+          exported:
+            ts.isVariableStatement(statement) && isExported(statement),
+          async: isAsync(init),
+          startLine: lineAt(node.getStart()),
+          endLine: lineAt(init.getEnd()),
+        });
+      }
+    }
+
+    if (ts.isClassDeclaration(node) && node.name) {
+      const cls: ClassNode = {
+        id: classIdOf(node.name.text),
+        name: node.name.text,
+        exported: isExported(node),
+        startLine: lineAt(node.getStart()),
+        endLine: lineAt(node.getEnd()),
+      };
+      classes.push(cls);
+      for (const clause of node.heritageClauses ?? []) {
+        if (clause.token !== ts.SyntaxKind.ExtendsKeyword) continue;
+        for (const heritageType of clause.types) {
+          // Only plain `extends Bar`; mixins / `extends getBase()` skipped.
+          if (ts.isIdentifier(heritageType.expression)) {
+            extendsList.push({
+              classId: cls.id,
+              parentClassName: heritageType.expression.text,
+            });
+          }
+        }
+      }
+    }
+
+    if (ts.isCallExpression(node)) {
+      const testName = testCaseName(node);
+      if (testName !== undefined) {
+        tests.push({
+          id: `${relPath}#${testName}#${lineAt(node.getStart())}`,
+          name: testName,
+          filePath: relPath,
+          startLine: lineAt(node.getStart()),
+        });
+      }
+      const callee = callCallee(node);
+      if (callee && funcStack.length > 0) {
+        calls.push({
+          callerId: funcStack[funcStack.length - 1],
+          calleeName: callee.name,
+          kind: callee.kind,
+        });
+      }
+    }
+
+    if (frameId !== undefined) funcStack.push(frameId);
+    ts.forEachChild(node, visit);
+    if (frameId !== undefined) funcStack.pop();
+  };
+
+  visit(sourceFile);
+
+  for (const statement of sourceFile.statements) {
+    if (!ts.isImportDeclaration(statement)) continue;
+    const specifier = statement.moduleSpecifier;
+    if (!ts.isStringLiteral(specifier)) continue;
+    const moduleSpecifier = specifier.text;
+    if (isExternalSpecifier(moduleSpecifier)) {
+      imports.push({ modulePath: moduleSpecifier, isExternal: true });
+    } else {
+      const resolved = resolveRelativeImport(
+        program,
+        repoRoot,
+        filePathAbs,
+        moduleSpecifier,
+      );
+      imports.push({
+        modulePath: resolved.modulePath,
+        isExternal: false,
+        resolvedBy: resolved.resolvedBy,
+      });
+    }
+  }
+
+  return {
+    file: {
+      path: relPath,
+      language: detectLanguage(filePathAbs),
+      lastIndexedAt: new Date().toISOString(),
+    },
+    functions,
+    classes,
+    tests,
+    imports,
+    calls,
+    methodOf,
+    extends: extendsList,
+  };
+}
+
+export async function extractRepo(
+  repoRoot: string,
+  patterns?: string[],
+  opts?: { quiet?: boolean },
+): Promise<ExtractedFile[]> {
+  const pats = patterns && patterns.length > 0 ? patterns : DEFAULT_PATTERNS;
+  const files = (
+    await fg(pats, {
+      cwd: repoRoot,
+      ignore: EXCLUDE_PATTERNS,
+      absolute: true,
+      onlyFiles: true,
+      suppressErrors: true,
+    })
+  ).filter((f) => !f.endsWith(".d.ts"));
+
+  const total = files.length;
+  const spinner = opts?.quiet
+    ? undefined
+    : ora(`Indexing 0/${total} files`).start();
+
+  const results: ExtractedFile[] = [];
+  try {
+    for (let i = 0; i < files.length; i++) {
+      results.push(await extractFile(files[i], repoRoot));
+      if (spinner) {
+        spinner.text = `Indexing ${i + 1}/${total}: ${repoRelative(repoRoot, files[i])}`;
+      }
+    }
+  } finally {
+    spinner?.stop();
+  }
+  return results;
+}
+
+/* ------------------------------ helpers ----------------------------- */
+
+/** Repo-relative path with forward slashes, even on Windows. */
+function repoRelative(repoRoot: string, filePath: string): string {
+  return path.relative(repoRoot, filePath).split(path.sep).join("/");
+}
+
+function detectLanguage(filePath: string): Language {
+  const ext = path.extname(filePath).toLowerCase();
+  return ext === ".ts" || ext === ".tsx" ? "typescript" : "javascript";
+}
+
+/** External if the specifier doesn't start with "." or "/". */
+function isExternalSpecifier(specifier: string): boolean {
+  return !/^(\.|\/)/.test(specifier);
+}
+
+/**
+ * Resolve a relative import to a repo-relative module path.
+ *
+ * Prefers the compiler's own resolution (ts.resolveModuleName), which
+ * handles extensionless specifiers, .tsx, index files, etc. If the compiler
+ * can't resolve it or resolves it outside the repo (e.g. missing file),
+ * fall back to plain path.resolve + path.relative math — which may point at
+ * a file that doesn't exist, but keeps the graph's module paths stable.
+ * The caller records which path was taken via `resolvedBy`.
+ */
+function resolveRelativeImport(
+  program: ts.Program,
+  repoRoot: string,
+  filePath: string,
+  specifier: string,
+): { modulePath: string; resolvedBy: "compiler" | "fallback" } {
+  const resolved = ts.resolveModuleName(
+    specifier,
+    filePath,
+    program.getCompilerOptions(),
+    ts.sys,
+  );
+  const target = resolved.resolvedModule?.resolvedFileName;
+  if (target) {
+    const rel = path.relative(repoRoot, target);
+    if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
+      return {
+        modulePath: rel.split(path.sep).join("/"),
+        resolvedBy: "compiler",
+      };
+    }
+  }
+  const fallback = path.relative(
+    repoRoot,
+    path.resolve(path.dirname(filePath), specifier),
+  );
+  return {
+    modulePath: fallback.split(path.sep).join("/"),
+    resolvedBy: "fallback",
+  };
+}
+
+/**
+ * Test callee detection: `it`, `test`, `it.only`, `it.skip`, `test.only`,
+ * `test.skip` — with a string-literal first argument (the test name).
+ * describe blocks are NOT treated as tests; nested describe context is not
+ * captured in the name (known limitation).
+ */
+function testCaseName(call: ts.CallExpression): string | undefined {
+  const callee = call.expression;
+  let isTestCallee = false;
+  if (ts.isIdentifier(callee)) {
+    isTestCallee = callee.text === "it" || callee.text === "test";
+  } else if (ts.isPropertyAccessExpression(callee)) {
+    const base = callee.expression;
+    const prop = callee.name;
+    isTestCallee =
+      ts.isIdentifier(base) &&
+      (base.text === "it" || base.text === "test") &&
+      ts.isIdentifier(prop) &&
+      (prop.text === "only" || prop.text === "skip");
+  }
+  if (!isTestCallee) return undefined;
+  const firstArg = call.arguments[0];
+  return firstArg !== undefined && ts.isStringLiteral(firstArg)
+    ? firstArg.text
+    : undefined;
+}
+
+/**
+ * Call callee detection. Captures plain-Identifier callees (`foo()`) and
+ * `this.foo()` (PropertyAccess on `this`), tagged as kind "this" so the
+ * writer can prefer resolving those against the same class's methods.
+ * `obj.method()` and computed calls are skipped (documented limitation).
+ */
+function callCallee(
+  call: ts.CallExpression,
+): { name: string; kind: "identifier" | "this" } | undefined {
+  const expr = call.expression;
+  if (ts.isIdentifier(expr)) {
+    return { name: expr.text, kind: "identifier" };
+  }
+  if (
+    ts.isPropertyAccessExpression(expr) &&
+    expr.expression.kind === ts.SyntaxKind.ThisKeyword &&
+    ts.isIdentifier(expr.name)
+  ) {
+    return { name: expr.name.text, kind: "this" };
+  }
+  return undefined;
+}

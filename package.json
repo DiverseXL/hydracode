@@ -1,0 +1,35 @@
+{
+  "name": "hydracode",
+  "version": "0.1.0",
+  "description": "Index a codebase into a HydraDB graph and let AI coding agents query it for multi-hop, relationship-aware context (calls, imports, tests, config), plus a temporal memory layer for decisions.",
+  "type": "module",
+  "bin": {
+    "hydracode": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js",
+    "smoke": "tsx scripts/smoke-test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "commander": "^13.0.0",
+    "fast-glob": "^3.3.2",
+    "ora": "^8.1.0",
+    "picocolors": "^1.1.0",
+    "typescript": "^5.7.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0"
+  },
+  "license": "AGPL-3.0-or-later"
+}

@@ -1,0 +1,31 @@
+# Local HydraDB dev environment for hydracode.
+#
+# The image (docker/hydradb.Dockerfile) bakes the native graph-node build;
+# the auth token and runtime env come from .env at runtime via entrypoint.sh.
+# First `docker compose up --build` takes 10-30+ minutes (Rust release build).
+
+services:
+  hydradb:
+    build:
+      context: ./docker
+      dockerfile: hydradb.Dockerfile
+    entrypoint: ["/opt/hydradb/entrypoint.sh"]
+    ports:
+      - "8443:8443" # HTTP query API
+      - "7687:7687" # Bolt
+      - "9090:9090" # Admin
+    env_file:
+      - .env
+    volumes:
+      # Store survives container restarts; it lives outside the image layer
+      # so rebuilds don't wipe data either.
+      - hydradb-store:/opt/hydradb/.hydradb/store
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8443/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+volumes:
+  hydradb-store:
