@@ -38,8 +38,14 @@ export interface AskResultNode {
 
 /** A rendered path from getPathEvidence. */
 export interface AskEvidencePath {
-  /** Arrow-chain of display keys, e.g. `src/a.ts#foo → src/b.ts#bar`. */
+  /**
+   * Triplet chain, e.g. `[HydraClient.query] -[:CALLS]-> [extractRows]`.
+   * Falls back to a plain ` → ` arrow chain when the path carried no
+   * parseable relationship types.
+   */
   pathText: string;
+  /** Relationship type per hop (same ordering as the pathText chain). */
+  rels?: string[];
   weight?: number;
 }
 
@@ -174,7 +180,8 @@ export async function runAskPipeline(
     for (const p of paths.slice(0, 8)) {
       if (p.parseSucceeded) {
         evidence.push({
-          pathText: p.nodes.map((n) => chainDisplay(n.key)).join(" \u2192 "),
+          pathText: renderPathTriplet(p.nodes, p.rels),
+          rels: p.rels,
           weight: p.weight,
         });
       }
@@ -234,6 +241,47 @@ export function chainDisplay(key: string): string {
     parts.pop();
   }
   return parts.join("#");
+}
+
+/**
+ * Display label for one node in a triplet path — the function/method's
+ * qualified name (e.g. `HydraClient.query`, `extractRows`), the class name,
+ * or the bare path for File/Module nodes.
+ */
+export function pathSegmentDisplay(key: string): string {
+  const bare = key.replace(/^(file|module|function|class|test|memory):/, "");
+  if (key.startsWith("function:") || key.startsWith("test:")) {
+    // function:file#QualifiedName#line / test:file#name#line
+    const parts = bare.split("#");
+    if (parts.length >= 3) return parts[parts.length - 2] ?? bare;
+    return bare;
+  }
+  if (key.startsWith("class:")) {
+    // class:file#ClassName
+    const parts = bare.split("#");
+    return parts[parts.length - 1] ?? bare;
+  }
+  return bare;
+}
+
+/**
+ * Render a path as a triplet chain, e.g.
+ * `[HydraClient.query] -[:CALLS]-> [extractRows] -[:CALLS]-> [unwrapValue]`.
+ * Falls back to a plain arrow chain when the rel types are unavailable.
+ */
+function renderPathTriplet(
+  nodes: { key: string }[],
+  rels: string[] | undefined,
+): string {
+  const labels = nodes.map((n) => pathSegmentDisplay(n.key));
+  if (rels === undefined || rels.length !== nodes.length - 1) {
+    return labels.join(" \u2192 ");
+  }
+  let text = `[${labels[0]}]`;
+  for (let i = 0; i < rels.length; i++) {
+    text += ` -[:${rels[i]}]-> [${labels[i + 1]}]`;
+  }
+  return text;
 }
 
 /** Map a GraphNodeRef to an AskResultNode. */

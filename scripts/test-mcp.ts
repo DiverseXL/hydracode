@@ -15,7 +15,11 @@ import { HydraClient, unwrapValue } from "../src/hydra/client.js";
 import { NODE_LABELS } from "../src/graph/schema.js";
 import { runAskPipeline } from "../src/graph/askPipeline.js";
 import { checkDuplicateRisk } from "../src/graph/duplicateCheck.js";
-import { recordKnownDuplicate } from "../src/memory/store.js";
+import {
+  recallMemoryFacts,
+  recordKnownDuplicate,
+  recordMemoryFactAbout,
+} from "../src/memory/store.js";
 import { extractRepo } from "../src/extract/tsExtractor.js";
 import { writeExtractedFiles } from "../src/graph/writer.js";
 
@@ -90,6 +94,32 @@ server.tool(
       return { content: [{ type: "text" as const, text: JSON.stringify({ ...result, recorded }) }] };
     }
     return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
+  },
+);
+
+server.tool(
+  "hydracode_record_decision",
+  {
+    text: z.string(),
+    about: z.string().optional(),
+  },
+  async ({ text, about }) => {
+    if (!client_) return configErrorContent();
+    const { recorded } = await recordMemoryFactAbout(client_!, text, about);
+    return { content: [{ type: "text" as const, text: JSON.stringify({ recorded }) }] };
+  },
+);
+
+server.tool(
+  "hydracode_recall_memory",
+  {
+    query: z.string(),
+    about: z.string().optional(),
+  },
+  async ({ query, about }) => {
+    if (!client_) return configErrorContent();
+    const facts = await recallMemoryFacts(client_!, { query, about });
+    return { content: [{ type: "text" as const, text: JSON.stringify({ facts }) }] };
   },
 );
 
@@ -180,6 +210,43 @@ console.assert(recJson.candidates.length > 0, "expected candidates for summarize
 console.assert(typeof recJson.recorded?.key === "string", "recorded.key must be a string");
 console.assert(recJson.recorded.key.startsWith("memory:"), "recorded key must be memory:<uuid>");
 console.log(`✓ recorded=${recJson.recorded.key}, message="${recJson.message}"`);
+
+/* ---- Test 5: hydracode_recall_memory ------------------------------ */
+console.log("\n=== Test 5: hydracode_recall_memory ===");
+const recMemResult = await mcpClient.callTool({
+  name: "hydracode_recall_memory",
+  arguments: { query: "prefer published image" },
+});
+const recMemContent = (recMemResult.content as Array<{ type: string; text: string }>)[0]?.text;
+const recMemJson = JSON.parse(recMemContent ?? "{}");
+console.log("Parsed:", JSON.stringify(recMemJson, null, 2));
+console.assert(Array.isArray(recMemJson.facts), "facts must be an array");
+const recMemFacts = recMemJson.facts as Array<{ key: string; text: string; createdAt: string; about: string[] }>;
+for (const f of recMemFacts) {
+  console.assert(typeof f.key === "string" && f.key.startsWith("memory:"), "fact key must be memory:<uuid>");
+  console.assert(typeof f.text === "string", "fact text must be a string");
+  console.assert(typeof f.createdAt === "string", "fact createdAt must be a string");
+  console.assert(Array.isArray(f.about), "fact about must be an array");
+}
+const cliRecorded = recMemFacts.find((f) => f.text.includes("prefer the published GHCR image"));
+console.assert(cliRecorded !== undefined, "expected the CLI-recorded fact to come back through MCP");
+console.log(`✓ recall found ${recMemFacts.length} fact(s) via MCP, CLI-recorded fact present=${cliRecorded !== undefined}`);
+
+/* ---- Test 6: hydracode_recall_memory with --about ----------------- */
+console.log("\n=== Test 6: hydracode_recall_memory about=writeExtractedFiles ===");
+const recMemAboutResult = await mcpClient.callTool({
+  name: "hydracode_recall_memory",
+  arguments: { query: "anything", about: "writeExtractedFiles" },
+});
+const recMemAboutContent = (recMemAboutResult.content as Array<{ type: string; text: string }>)[0]?.text;
+const recMemAboutJson = JSON.parse(recMemAboutContent ?? "{}");
+console.log("Parsed:", JSON.stringify(recMemAboutJson, null, 2));
+const aboutFacts = (recMemAboutJson.facts as Array<{ text: string; about: string[] }>) ?? [];
+console.assert(
+  aboutFacts.some((f) => f.text.includes("prefer the published GHCR image")),
+  "expected the about-linked fact",
+);
+console.log(`✓ recall by about found ${aboutFacts.length} fact(s)`);
 
 /* ---- Tear down ---------------------------------------------------- */
 await mcpClient.close();

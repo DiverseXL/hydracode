@@ -114,8 +114,11 @@ function rowCells(row: unknown): unknown[] {
  *   "getUserData" / "get_user_data" / "GetUserData" → [get, user, data]
  * camelCase boundaries and leading-acronym runs are split; snake/kebab
  * separators are handled by the split on non-alphanumerics.
+ *
+ * Exported so memory/store.ts can apply the same tokenization to fact text
+ * for recall matching (same style, one implementation).
  */
-function nameTokens(name: string): string[] {
+export function nameTokens(name: string): string[] {
   return name
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2") // camelCase / PascalCase boundary
     .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2") // acronym run, e.g. "HTTPClient"

@@ -61,6 +61,12 @@ export interface GraphNodeRef {
 export interface HydraPathResult {
   /** Node refs in traversal order, source first. */
   nodes: GraphNodeRef[];
+  /**
+   * Relationship type per hop, `rels[i]` connects `nodes[i]` -> `nodes[i+1]`
+   * (e.g. ["CALLS", "CALLS"] for a 3-node path). Undefined when the engine
+   * response didn't carry parseable relationship entries.
+   */
+  rels?: string[];
   /** pathWeight, when the engine returned one. */
   weight?: number;
   /** True when the Path value parsed into `nodes`; false => see `raw`. */
@@ -314,7 +320,8 @@ export async function getPathEvidence(
     const weight = unwrapValue(weightCell);
     if (parsed) {
       paths.push({
-        nodes: parsed,
+        nodes: parsed.nodes,
+        rels: parsed.rels,
         weight: typeof weight === "number" ? weight : undefined,
         parseSucceeded: true,
       });
@@ -333,10 +340,15 @@ export async function getPathEvidence(
 
 /**
  * Defensively parse a `{type: "path", value: {nodes, relationships}}` cell
- * (shape confirmed live) into ordered GraphNodeRefs. Returns undefined when
- * the shape doesn't match what we know, so the caller can surface raw data.
+ * (shape confirmed live) into ordered GraphNodeRefs plus per-hop rel types.
+ * Returns undefined when the NODE shape doesn't match what we know, so the
+ * caller can surface raw data. Relationship entries are parsed leniently:
+ * if they can't be parsed the nodes still win (rels: undefined), because
+ * losing a path's nodes to a rel-shape drift would be a worse regression.
  */
-function parsePathCell(cell: unknown): GraphNodeRef[] | undefined {
+function parsePathCell(
+  cell: unknown,
+): { nodes: GraphNodeRef[]; rels: string[] | undefined } | undefined {
   if (cell === null || typeof cell !== "object") return undefined;
   const record = cell as Record<string, unknown>;
   if (record.type !== "path") return undefined;
@@ -359,7 +371,36 @@ function parsePathCell(cell: unknown): GraphNodeRef[] | undefined {
     if (typeof key !== "string") return undefined;
     refs.push({ id, key, label: labelFromKey(key) });
   }
-  return refs;
+
+  // Relationships: `rels[i]` is the type connecting nodes[i] -> nodes[i+1].
+  // The engine reports the type as `edge_type` (plain string) on each
+  // relationship entry — confirmed live (see file header).
+  const relationships = (value as Record<string, unknown>).relationships;
+  let rels: string[] | undefined;
+  if (Array.isArray(relationships)) {
+    const parsedRels: string[] = [];
+    let ok = true;
+    for (const rel of relationships) {
+      if (rel === null || typeof rel !== "object") {
+        ok = false;
+        break;
+      }
+      const t = unwrapRustScalar(
+        (rel as Record<string, unknown>).edge_type ??
+          (rel as Record<string, unknown>).type,
+      );
+      if (typeof t !== "string") {
+        ok = false;
+        break;
+      }
+      parsedRels.push(t);
+    }
+    if (ok && parsedRels.length === refs.length - 1) {
+      rels = parsedRels;
+    }
+  }
+
+  return { nodes: refs, rels };
 }
 
 /** Unwrap {"String": s} / {"Integer": n} / {"Bool": b} / {"Float": n}. */

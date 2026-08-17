@@ -11,10 +11,11 @@ import { loadConfig } from "./config.js";
 import { extractRepo, extractFile } from "./extract/tsExtractor.js";
 import { runAskPipeline, describeKey, chainDisplay } from "./graph/askPipeline.js";
 import type { AskResultNode, AskEvidencePath } from "./graph/askPipeline.js";
+import { runInstall } from "./install.js";
 import { getGraphStatus, MAX_HOPS } from "./graph/query.js";
 import { buildGraphSummary, renderAgentsMdSection, MARKER_START, MARKER_END } from "./graph/agentsSummary.js";
 import { checkDuplicateRisk, functionNameFromKey } from "./graph/duplicateCheck.js";
-import { recordKnownDuplicate } from "./memory/store.js";
+import { recordKnownDuplicate, recordMemoryFactAbout, recallMemoryFacts } from "./memory/store.js";
 import { writeExtractedFiles } from "./graph/writer.js";
 import { HydraClient } from "./hydra/client.js";
 import { HydraConnectionError, HydraQueryError } from "./hydra/errors.js";
@@ -251,11 +252,16 @@ program
     if (evidence.length > 0) {
       console.log(pc.bold(`\npaths from ${pc.cyan(describeKey(anchorKey))}`));
       for (const p of evidence) {
-        // pathText uses → (U+2192); replace with coloured dim arrow for terminal.
-        const rendered = p.pathText
-          .split(" \u2192 ")
-          .map((seg) => pc.green(seg))
-          .join(pc.dim(" → "));
+        // Triplet format `[a] -[:CALLS]-> [b]` when rels were available;
+        // fall back to the plain → arrow chain otherwise.
+        const rendered = p.pathText.includes(" -[")
+          ? p.pathText
+              .replace(/\[([^\]]+)\]/g, (_m, name: string) => pc.green(`[${name}]`))
+              .replace(/( -\[:[^\]]+\]-> )/g, (_m, sep: string) => pc.dim(sep))
+          : p.pathText
+              .split(" \u2192 ")
+              .map((seg) => pc.green(seg))
+              .join(pc.dim(" → "));
         console.log(
           `  ${rendered}${p.weight !== undefined ? pc.dim(`  (weight ${p.weight})`) : ""}`,
         );
@@ -268,10 +274,92 @@ program
   });
 
 program
+  .command("install")
+  .description(
+    "Install hydracode as an MCP server for Cursor and/or Claude Code — writes/updates " +
+      "their MCP config files so an agent picks up hydracode automatically",
+  )
+  .action(async () => {
+    await runInstall();
+  });
+
+const memoryCmd = program
   .command("memory")
-  .description("Work with the temporal memory layer")
-  .action(() => {
-    console.log("memory: not implemented yet");
+  .description("Record and recall decisions in the temporal memory layer");
+
+memoryCmd
+  .command("record")
+  .description("Record a project decision, convention, or rationale in the memory layer")
+  .argument("<text>", "the decision/note text to record")
+  .option("--about <name>", "function/class/file name to link this fact to via ABOUT")
+  .action(async (text: string, opts: { about?: string }) => {
+    try {
+      const config = loadConfig();
+      const client = new HydraClient(config);
+
+      console.log(pc.bold("hydracode memory record"));
+      console.log();
+
+      const { recorded, about } = await recordMemoryFactAbout(client, text, opts.about);
+      console.log(pc.green(`Recorded: ${recorded.key}`));
+      console.log(pc.dim(`  ${recorded.text}`));
+      console.log(pc.dim(`  createdAt: ${recorded.createdAt}`));
+      if (about.length > 0) {
+        console.log(pc.dim(`  about: ${about.map((a) => a.key).join(", ")}`));
+      }
+    } catch (err) {
+      if (err instanceof HydraConnectionError) {
+        console.error(pc.red(`\nerror: ${err.message}`));
+      } else if (err instanceof HydraQueryError) {
+        console.error(
+          pc.red(`\nerror: HydraDB rejected a query (HTTP ${err.status}): ${err.body}`),
+        );
+      } else {
+        console.error(pc.red(`\nerror: ${err instanceof Error ? err.message : String(err)}`));
+      }
+      process.exitCode = 1;
+    }
+  });
+
+memoryCmd
+  .command("recall")
+  .description(
+    "Recall recorded decisions matching a query, or all facts linked to a node via --about",
+  )
+  .argument("<query>", "search text (ignored when --about is given)")
+  .option("--about <name>", "only recall facts linked to this function/class/file")
+  .action(async (query: string, opts: { about?: string }) => {
+    try {
+      const config = loadConfig();
+      const client = new HydraClient(config);
+
+      console.log(pc.bold("hydracode memory recall"));
+      console.log();
+
+      const facts = await recallMemoryFacts(client, { query, about: opts.about });
+      if (facts.length === 0) {
+        console.log(pc.dim("no matching facts found"));
+      } else {
+        for (const f of facts) {
+          console.log(`  ${pc.green(f.key)} ${pc.dim(`(${f.createdAt})`)}`);
+          console.log(`    ${f.text}`);
+          if (f.about.length > 0) {
+            console.log(pc.dim(`    about: ${f.about.join(", ")}`));
+          }
+        }
+      }
+    } catch (err) {
+      if (err instanceof HydraConnectionError) {
+        console.error(pc.red(`\nerror: ${err.message}`));
+      } else if (err instanceof HydraQueryError) {
+        console.error(
+          pc.red(`\nerror: HydraDB rejected a query (HTTP ${err.status}): ${err.body}`),
+        );
+      } else {
+        console.error(pc.red(`\nerror: ${err instanceof Error ? err.message : String(err)}`));
+      }
+      process.exitCode = 1;
+    }
   });
 
 program

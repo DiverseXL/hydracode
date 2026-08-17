@@ -9,27 +9,27 @@
 
 ## Code graph summary (auto-generated)
 
-_Last synced: 2026-08-17T13:15:23.439Z — 20 files, 94 functions, 3 classes, 0 tests indexed._
+_Last synced: 2026-08-17T20:08:56.071Z — 23 files, 128 functions, 3 classes, 0 tests indexed._
 
 ### High fan-in functions (change with care — many callers depend on these)
 
-- `src/hydra/client.ts#HydraClient.query#47` — 17 callers
+- `src/hydra/client.ts#HydraClient.query#47` — 21 callers
 - `src/config.ts#loadConfig#74` — 5 callers
 - `src/graph/writer.ts#prefixedId#97` — 5 callers
 - `src/config.ts#get#101` — 4 callers
+- `src/graph/hashId.ts#hashToVertexId#35` — 4 callers
 - `src/extract/tsExtractor.ts#extractTypeNameFromTypeNode#459` — 3 callers
 - `src/graph/agentsSummary.ts#cellNum#72` — 3 callers
-- `src/graph/agentsSummary.ts#cellStr#67` — 3 callers
 
 ### Most-connected files
 
 - `src/extract/tsExtractor.ts` — 20 functions
+- `src/graph/duplicateCheck.ts` — 16 functions
 - `src/graph/query.ts` — 13 functions
 - `src/graph/writer.ts` — 13 functions
 - `src/graph/agentsSummary.ts` — 11 functions
 - `src/hydra/client.ts` — 8 functions, 1 class
-- `src/cli.ts` — 5 functions
-- `src/config.ts` — 4 functions
+- `src/install.ts` — 9 functions
 
 ### Test coverage
 

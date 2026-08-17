@@ -28,7 +28,11 @@ import { extractRepo } from "../extract/tsExtractor.js";
 import { runAskPipeline } from "../graph/askPipeline.js";
 import { checkDuplicateRisk } from "../graph/duplicateCheck.js";
 import { getGraphStatus } from "../graph/query.js";
-import { recordKnownDuplicate } from "../memory/store.js";
+import {
+  recallMemoryFacts,
+  recordKnownDuplicate,
+  recordMemoryFactAbout,
+} from "../memory/store.js";
 import { writeExtractedFiles } from "../graph/writer.js";
 import { HydraClient } from "../hydra/client.js";
 
@@ -273,6 +277,73 @@ server.tool(
       }
       return {
         content: [{ type: "text", text: JSON.stringify(result) }],
+      };
+    });
+  },
+);
+
+/* ------------------------------------------------------------------ */
+/* Tool: hydracode_record_decision                                     */
+/* ------------------------------------------------------------------ */
+
+server.tool(
+  "hydracode_record_decision",
+  "Record a project decision, convention, or rationale so future sessions (yours or " +
+    "another agent's) can recall why something was done a certain way. Use this after " +
+    "making a non-obvious choice — e.g. picking one approach over another, or deciding " +
+    "not to fix something yet.",
+  {
+    text: z
+      .string()
+      .describe("The decision, convention, or rationale to record."),
+    about: z
+      .string()
+      .optional()
+      .describe(
+        "Optional: name of a function, class, or file to link this fact to via an ABOUT edge " +
+          "(resolved against the indexed graph; use the exact qualified name or file path).",
+      ),
+  },
+  async ({ text, about }) => {
+    if (configError || !client) return configErrorContent();
+    return safeCall(async () => {
+      const { recorded } = await recordMemoryFactAbout(client!, text, about);
+      return {
+        content: [{ type: "text", text: JSON.stringify({ recorded }) }],
+      };
+    });
+  },
+);
+
+/* ------------------------------------------------------------------ */
+/* Tool: hydracode_recall_memory                                       */
+/* ------------------------------------------------------------------ */
+
+server.tool(
+  "hydracode_recall_memory",
+  "Recall past decisions or conventions recorded for this project. Use this before " +
+    "making an architectural choice, to check whether the team already decided something " +
+    "relevant. Pass `about` to get facts linked to a specific function/class/file, or " +
+    "`query` for a text match against recorded facts.",
+  {
+    query: z
+      .string()
+      .describe(
+        "Search text matched against recorded fact text (ignored when `about` is given).",
+      ),
+    about: z
+      .string()
+      .optional()
+      .describe(
+        "Optional: only return facts linked via ABOUT to this function/class/file name.",
+      ),
+  },
+  async ({ query, about }) => {
+    if (configError || !client) return configErrorContent();
+    return safeCall(async () => {
+      const facts = await recallMemoryFacts(client!, { query, about });
+      return {
+        content: [{ type: "text", text: JSON.stringify({ facts }) }],
       };
     });
   },
