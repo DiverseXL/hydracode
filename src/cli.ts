@@ -1,10 +1,14 @@
 #!/usr/bin/env node
 
+import fs from "node:fs";
+import { execSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { Command } from "commander";
 import pc from "picocolors";
+import fg from "fast-glob";
 import { loadConfig } from "./config.js";
-import { extractRepo } from "./extract/tsExtractor.js";
+import { extractRepo, extractFile } from "./extract/tsExtractor.js";
 import { runAskPipeline, describeKey, chainDisplay } from "./graph/askPipeline.js";
 import type { AskResultNode, AskEvidencePath } from "./graph/askPipeline.js";
 import { getGraphStatus, MAX_HOPS } from "./graph/query.js";
@@ -40,27 +44,114 @@ program
     [],
   )
   .option("--quiet", "suppress progress spinners")
-  .action(async (opts: { path: string; pattern: string[]; quiet: boolean }) => {
+  .option("--watch", "watch for changes and incrementally reindex")
+  .option("--changed-only", "index only files changed in the most recent commit")
+  .action(async (opts: { path: string; pattern: string[]; quiet: boolean; watch?: boolean; changedOnly?: boolean }) => {
     const repoRoot = path.resolve(opts.path);
-    const patterns =
-      opts.pattern.length > 0 ? opts.pattern : undefined;
+    const activePatterns = opts.pattern.length > 0 ? opts.pattern : [DEFAULT_INDEX_PATTERNS];
     const quiet = opts.quiet;
 
     try {
       const config = loadConfig();
       const client = new HydraClient(config);
 
+      const incrementalIndex = async (filePaths: string[]) => {
+        const existingFiles = filePaths.filter(f => fs.existsSync(f));
+        const deletedFiles = filePaths.filter(f => !fs.existsSync(f));
+        
+        for (const deleted of deletedFiles) {
+          console.log(pc.yellow(`file deleted: ${deleted} — stale graph nodes for this file are not automatically removed yet`));
+        }
+        
+        if (existingFiles.length === 0) return;
+        
+        const extracted = [];
+        for (const f of existingFiles) {
+          extracted.push(await extractFile(f, repoRoot));
+        }
+        
+        const start = Date.now();
+        await writeExtractedFiles(extracted, client, { quiet: true });
+        const ms = Date.now() - start;
+        console.log(pc.green(`reindexed ${extracted.length} file(s) in ${ms}ms`));
+      };
+
+      if (opts.changedOnly) {
+        console.log(pc.bold("hydracode index --changed-only"));
+        try {
+          let diffOutput = "";
+          try {
+            diffOutput = execSync("git diff --name-only HEAD~1 HEAD", { cwd: repoRoot, encoding: "utf8" });
+          } catch {
+            // fallback for first commit or detached head
+            diffOutput = execSync("git ls-files", { cwd: repoRoot, encoding: "utf8" });
+          }
+          
+          const changedFiles = diffOutput.split('\n').map(l => l.trim()).filter(Boolean);
+          const changedAbs = changedFiles.map(f => path.join(repoRoot, f));
+          
+          const allMatched = fg.sync(activePatterns, { cwd: repoRoot, absolute: true, dot: true });
+          const matchedSet = new Set(allMatched.map(f => path.normalize(f)));
+          const matchedFiles = changedAbs.filter(f => matchedSet.has(path.normalize(f)));
+          
+          if (matchedFiles.length === 0) {
+            console.log(pc.dim("no changed files match indexing patterns."));
+          } else {
+            await incrementalIndex(matchedFiles);
+          }
+        } catch (err) {
+          console.log(pc.yellow(`failed to determine changed files (${err}), falling back to full index`));
+          const files = await extractRepo(repoRoot, activePatterns, { quiet });
+          const summary = await writeExtractedFiles(files, client, { quiet });
+          console.log(pc.green("\nwrite summary:"));
+          console.log(JSON.stringify(summary, null, 2));
+        }
+        return;
+      }
+
       console.log(pc.bold("hydracode index"));
-      console.log(
-        pc.dim(`extracting: ${repoRoot} (${(patterns ?? [DEFAULT_INDEX_PATTERNS]).join(", ")})`),
-      );
-      const files = await extractRepo(repoRoot, patterns, { quiet });
+      console.log(pc.dim(`extracting: ${repoRoot} (${activePatterns.join(", ")})`));
+      const files = await extractRepo(repoRoot, activePatterns, { quiet });
 
       console.log(pc.dim(`writing ${files.length} files to ${config.httpUri}...`));
       const summary = await writeExtractedFiles(files, client, { quiet });
 
       console.log(pc.green("\nwrite summary:"));
       console.log(JSON.stringify(summary, null, 2));
+
+      if (opts.watch) {
+        console.log(pc.blue(`\nWatching for changes in ${repoRoot}...`));
+        const changedPaths = new Set<string>();
+        let debounceTimer: NodeJS.Timeout | null = null;
+        
+        fs.watch(repoRoot, { recursive: true }, (eventType, filename) => {
+          if (!filename) return;
+          const absPath = path.join(repoRoot, filename);
+          if (absPath.includes("node_modules") || absPath.includes(".git") || absPath.includes(".hydracode")) return;
+          
+          const normalized = path.normalize(absPath);
+          const allMatched = fg.sync(activePatterns, { cwd: repoRoot, absolute: true, dot: true });
+          const matchedSet = new Set(allMatched.map(f => path.normalize(f)));
+          
+          if (matchedSet.has(normalized)) {
+            changedPaths.add(absPath);
+            
+            if (debounceTimer) clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(async () => {
+              const pathsToProcess = Array.from(changedPaths);
+              changedPaths.clear();
+              try {
+                await incrementalIndex(pathsToProcess);
+              } catch (e) {
+                console.error(pc.red(`watch reindex failed: ${e}`));
+              }
+            }, 400);
+          }
+        });
+        
+        // Keep alive
+        await new Promise(() => {});
+      }
     } catch (err) {
       if (err instanceof HydraConnectionError) {
         console.error(pc.red(`\nerror: ${err.message}`));
@@ -231,6 +322,49 @@ program
       }
       process.exitCode = 1;
     }
+  });
+
+program
+  .command("init-hooks")
+  .description("Install git post-commit hook for auto-reindexing")
+  .action(() => {
+    try {
+      execSync("git rev-parse --git-dir", { stdio: "ignore" });
+    } catch {
+      console.error(pc.red("error: not a git repository"));
+      process.exitCode = 1;
+      return;
+    }
+    
+    const cliPath = fileURLToPath(import.meta.url);
+    const nodeExec = process.execPath;
+    
+    const gitDir = execSync("git rev-parse --git-dir", { encoding: "utf8" }).trim();
+    const hookPath = path.join(gitDir, "hooks", "post-commit");
+    
+    let hookContent = "";
+    if (fs.existsSync(hookPath)) {
+      hookContent = fs.readFileSync(hookPath, "utf8");
+      if (hookContent.includes("# >>> hydracode post-commit >>>")) {
+        console.log(pc.green("hydracode post-commit hook is already installed."));
+        return;
+      }
+    } else {
+      hookContent = "#!/bin/sh\n\n";
+    }
+    
+    const hookBlock = `
+# >>> hydracode post-commit >>>
+( "${nodeExec.replace(/\\/g, '/')}" "${cliPath.replace(/\\/g, '/')}" index . --changed-only > .git/hydracode-reindex.log 2>&1 & )
+# <<< hydracode post-commit <<<
+`;
+    fs.writeFileSync(hookPath, hookContent + hookBlock);
+    
+    try {
+      execSync(`chmod +x "${hookPath}"`, { stdio: "ignore" });
+    } catch {}
+    
+    console.log(pc.green(`Successfully installed hydracode post-commit hook to ${hookPath}`));
   });
 
 program.parseAsync().catch((err) => {
