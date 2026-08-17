@@ -1,0 +1,17 @@
+# Use the prebuilt hydradb image from GHCR instead of building it from
+# source (skips the 10-30+ minute Rust release build).
+#
+# Merge with the dev compose file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.published.yml pull
+#   docker compose -f docker-compose.yml -f docker-compose.published.yml up
+#
+# Everything else (ports, env_file, volumes, healthcheck, entrypoint) is
+# inherited from docker-compose.yml via the override merge.
+#
+# The image is published by scripts/publish-docker.sh and by CI
+# (.github/workflows/publish-docker.yml) on every push to main and on v* tags.
+
+services:
+  hydradb:
+    image: ghcr.io/diversexl/hydracode/hydradb:latest

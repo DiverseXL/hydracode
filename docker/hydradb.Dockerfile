@@ -73,11 +73,17 @@ COPY --from=audit /opt/hydradb /opt/hydradb
 # the incremental cargo state instead of recompiling from zero. Trade-off:
 # RUN steps with cache mounts always re-execute, but cargo short-circuits on
 # up-to-date artifacts.
+#
+# Cache mounts are EXCLUDED from the image layer, so the compiled binary
+# living at /opt/hydradb/target would never ship in the image (it would only
+# exist inside the build container). Copy it out to a regular path so the
+# final image actually contains graph-node.
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/opt/hydradb/target \
     cd /opt/hydradb \
-  && cargo build --locked --release --features server-runtime --bin graph-node
+  && cargo build --locked --release --features server-runtime --bin graph-node \
+  && install -m 755 /opt/hydradb/target/release/graph-node /opt/hydradb/graph-node
 
 WORKDIR /opt/hydradb
 
@@ -88,3 +94,9 @@ COPY entrypoint.sh /opt/hydradb/entrypoint.sh
 RUN sed -i 's/\r$//' /opt/hydradb/entrypoint.sh && chmod +x /opt/hydradb/entrypoint.sh
 
 EXPOSE 8443 7687 9090
+
+# Bake the entrypoint into the image so the published image is runnable
+# standalone (`docker run ghcr.io/.../hydradb`) with nothing but env vars.
+# docker-compose.yml still overrides `entrypoint` explicitly, so compose
+# users see no change.
+ENTRYPOINT ["/opt/hydradb/entrypoint.sh"]

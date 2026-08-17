@@ -38,4 +38,4 @@ export GRAPH_AUTH_TOKEN_FILE="$TOKEN_FILE"
 export GRAPH_ALLOW_PLAINTEXT=true
 export RUST_MIN_STACK=33554432
 
-exec ./target/release/graph-node
+exec /opt/hydradb/graph-node

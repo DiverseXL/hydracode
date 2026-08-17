@@ -76,6 +76,39 @@ npx tsx scripts/index-self.ts   # index this repo's src/ and write the graph
 Ports: **8443** HTTP query API, **7687** Bolt, **9090** admin. Graph data
 persists in the `hydradb-store` named volume. To stop: `docker compose down`.
 
+### Prebuilt image (skip the Rust build)
+
+A prebuilt image is published to GHCR
+(`ghcr.io/diversexl/hydracode/hydradb`) so you can skip the 10-30+ minute
+build entirely:
+
+```bash
+cp .env.example .env
+
+docker compose -f docker-compose.yml -f docker-compose.published.yml pull
+docker compose -f docker-compose.yml -f docker-compose.published.yml up
+```
+
+The published image is exactly what `docker compose up --build` produces —
+same Dockerfile, same baked `graph-node` binary — and it is refreshed on
+every push to `main` and on `v*` tags (see `.github/workflows/publish-docker.yml`).
+
+#### Publishing the image (maintainers)
+
+The image is published automatically by CI. To publish manually (e.g. before
+setting up CI, or from a local machine):
+
+```bash
+# one-time: authenticate against GHCR (password = PAT with write:packages)
+docker login ghcr.io --username <your-github-username>
+
+# build + tag locally (no push)
+scripts/publish-docker.sh
+
+# build, tag, and push latest/<version>/sha-<sha>
+scripts/publish-docker.sh --push
+```
+
 ## Development
 
 ```bash
