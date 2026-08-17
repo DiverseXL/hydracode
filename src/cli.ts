@@ -407,3 +407,4 @@ function printResultList(label: string, nodes: AskResultNode[], maxHops: number)
 void (undefined as unknown as AskEvidencePath);
 // test hook
 // test hook 3
+// test hook 4
