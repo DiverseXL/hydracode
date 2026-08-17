@@ -12,6 +12,9 @@ import { extractRepo, extractFile } from "./extract/tsExtractor.js";
 import { runAskPipeline, describeKey, chainDisplay } from "./graph/askPipeline.js";
 import type { AskResultNode, AskEvidencePath } from "./graph/askPipeline.js";
 import { getGraphStatus, MAX_HOPS } from "./graph/query.js";
+import { buildGraphSummary, renderAgentsMdSection, MARKER_START, MARKER_END } from "./graph/agentsSummary.js";
+import { checkDuplicateRisk, functionNameFromKey } from "./graph/duplicateCheck.js";
+import { recordKnownDuplicate } from "./memory/store.js";
 import { writeExtractedFiles } from "./graph/writer.js";
 import { HydraClient } from "./hydra/client.js";
 import { HydraConnectionError, HydraQueryError } from "./hydra/errors.js";
@@ -367,6 +370,171 @@ node "${cliPath.replace(/\\/g, '/')}" index --changed-only >> .git/hydracode-rei
     } catch {}
     
     console.log(pc.green(`Successfully installed hydracode post-commit hook to ${hookPath}`));
+  });
+
+program
+  .command("sync-agents-md")
+  .description("Generate or update AGENTS.md with graph-derived facts")
+  .action(async () => {
+    try {
+      const config = loadConfig();
+      const client = new HydraClient(config);
+
+      console.log(pc.bold("hydracode sync-agents-md"));
+      console.log();
+
+      const summary = await buildGraphSummary(client);
+      const mdSection = renderAgentsMdSection(summary);
+      const agentsPath = path.join(process.cwd(), "AGENTS.md");
+
+      let newContent: string;
+      let changeType: string;
+
+      if (!fs.existsSync(agentsPath)) {
+        // File does not exist — create it with a header comment + generated section.
+        newContent =
+          `# AGENTS.md\n` +
+          `# Add your project conventions, architecture notes, and rules above or below\n` +
+          `# the auto-generated section. hydracode will preserve everything outside the markers.\n` +
+          `\n` +
+          mdSection +
+          `\n`;
+        changeType = "Created";
+      } else {
+        const existing = fs.readFileSync(agentsPath, "utf8");
+        const startIdx = existing.indexOf(MARKER_START);
+        const endIdx = existing.indexOf(MARKER_END);
+        const hasStart = startIdx !== -1;
+        const hasEnd = endIdx !== -1;
+
+        if (hasStart && hasEnd && endIdx > startIdx) {
+          // Replace only the block between (and including) the markers.
+          newContent =
+            existing.slice(0, startIdx) +
+            mdSection +
+            existing.slice(endIdx + MARKER_END.length);
+          changeType = "Replaced existing auto-generated section in";
+        } else if (!hasStart && !hasEnd) {
+          // No markers present — append.
+          newContent = existing.trimEnd() + "\n\n" + mdSection + "\n";
+          changeType = "Appended new auto-generated section to";
+        } else {
+          // Exactly one marker present — corrupted state, refuse to touch.
+          console.error(
+            pc.red(
+              `\nerror: AGENTS.md contains only one of the two hydracode markers.\n` +
+              `  Start marker ${hasStart ? "found" : "MISSING"}: ${MARKER_START}\n` +
+              `  End marker   ${hasEnd ? "found" : "MISSING"}: ${MARKER_END}\n` +
+              `\n` +
+              `  Please fix or remove the partial markers manually,\n` +
+              `  then run \`hydracode sync-agents-md\` again.`,
+            ),
+          );
+          process.exitCode = 1;
+          return;
+        }
+      }
+
+      fs.writeFileSync(agentsPath, newContent, "utf8");
+      console.log(pc.green(`${changeType}: ${agentsPath}`));
+      console.log();
+      console.log(`  Aggregation: ${summary.aggregationStrategy}`);
+      console.log(`  Files indexed: ${summary.counts.files}`);
+      console.log(`  Functions indexed: ${summary.counts.functions}`);
+      console.log(`  High fan-in functions listed: ${summary.highFanIn.length}`);
+      console.log(`  Most-connected files listed: ${summary.mostConnected.length}`);
+    } catch (err) {
+      if (err instanceof HydraConnectionError) {
+        console.error(pc.red(`\nerror: ${err.message}`));
+      } else if (err instanceof HydraQueryError) {
+        console.error(
+          pc.red(`\nerror: HydraDB rejected a query (HTTP ${err.status}): ${err.body}`),
+        );
+      } else {
+        console.error(pc.red(`\nerror: ${err instanceof Error ? err.message : String(err)}`));
+      }
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command("check-duplicate")
+  .description("Check whether a proposed function name may duplicate existing code in the graph")
+  .argument("<proposedName>", "name of the function you are about to write")
+  .option("--file <path>", "target file the new function would live in (same-file check hint)")
+  .option("--record <reason>", "record a deliberate-duplicate decision in the memory layer with this reason")
+  .action(async (proposedName: string, opts: { file?: string; record?: string }) => {
+    try {
+      const config = loadConfig();
+      const client = new HydraClient(config);
+
+      console.log(pc.bold("hydracode check-duplicate"));
+      console.log();
+      console.log(
+        `  proposed: ${pc.cyan(proposedName)}` +
+          (opts.file ? ` (target file: ${pc.dim(opts.file)})` : ""),
+      );
+      console.log();
+
+      const result = await checkDuplicateRisk(
+        client,
+        proposedName,
+        opts.file ? { targetFile: opts.file } : undefined,
+      );
+      console.log(result.message);
+
+      if (result.candidates.length > 0) {
+        console.log();
+        for (const c of result.candidates) {
+          const confidenceLabel =
+            c.confidence === "high"
+              ? pc.red(pc.bold(c.confidence))
+              : c.confidence === "medium"
+                ? pc.yellow(c.confidence)
+                : pc.dim(c.confidence);
+          const reasonLabel =
+            c.matchReason === "exact_name"
+              ? "exact name match"
+              : c.matchReason === "similar_name"
+                ? "similar name"
+                : "similar purpose in this file";
+          console.log(
+            `  - ${pc.green(functionNameFromKey(c.key))} [${confidenceLabel} confidence — ${reasonLabel}] ${pc.dim(`${c.file}:${c.line}`)}`,
+          );
+        }
+      }
+
+      if (opts.record !== undefined) {
+        if (result.candidates.length === 0) {
+          console.log(
+            pc.yellow(
+              "\nNo similar functions found — nothing to record (a deliberate-duplicate decision requires a flagged match).",
+            ),
+          );
+        } else {
+          const fact = await recordKnownDuplicate(
+            client,
+            proposedName,
+            opts.record,
+            result.candidates,
+          );
+          console.log();
+          console.log(pc.green(`Recorded deliberate-duplicate decision in memory: ${fact.key}`));
+          console.log(pc.dim(`  ${fact.text}`));
+        }
+      }
+    } catch (err) {
+      if (err instanceof HydraConnectionError) {
+        console.error(pc.red(`\nerror: ${err.message}`));
+      } else if (err instanceof HydraQueryError) {
+        console.error(
+          pc.red(`\nerror: HydraDB rejected a query (HTTP ${err.status}): ${err.body}`),
+        );
+      } else {
+        console.error(pc.red(`\nerror: ${err instanceof Error ? err.message : String(err)}`));
+      }
+      process.exitCode = 1;
+    }
   });
 
 program.parseAsync().catch((err) => {

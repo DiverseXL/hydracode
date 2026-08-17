@@ -26,7 +26,9 @@ import { z } from "zod";
 import { loadConfig } from "../config.js";
 import { extractRepo } from "../extract/tsExtractor.js";
 import { runAskPipeline } from "../graph/askPipeline.js";
+import { checkDuplicateRisk } from "../graph/duplicateCheck.js";
 import { getGraphStatus } from "../graph/query.js";
+import { recordKnownDuplicate } from "../memory/store.js";
 import { writeExtractedFiles } from "../graph/writer.js";
 import { HydraClient } from "../hydra/client.js";
 
@@ -205,6 +207,72 @@ server.tool(
       const status = await getGraphStatus(client!);
       return {
         content: [{ type: "text", text: JSON.stringify(status) }],
+      };
+    });
+  },
+);
+
+/* ------------------------------------------------------------------ */
+/* Tool: hydracode_check_duplicate                                     */
+/* ------------------------------------------------------------------ */
+
+server.tool(
+  "hydracode_check_duplicate",
+  "Check whether a function you're about to write might already exist in this codebase " +
+    "under a different name, or something very similar. ALWAYS call this before implementing " +
+    "a new function or utility, to avoid creating duplicate logic. Returns matching candidates " +
+    "with file locations if anything similar is found, or confirms it's safe to proceed if " +
+    "nothing matches. If you decide to write the function anyway despite the matches, pass " +
+    "recordReason to record a deliberate-duplicate decision in the memory layer.",
+  {
+    proposedName: z
+      .string()
+      .describe("The name of the function you are about to write."),
+    targetFile: z
+      .string()
+      .optional()
+      .describe(
+        "Optional: repo-relative path of the file the new function would live in, to also " +
+          "catch same-file near-duplicates (e.g. src/db/users.ts).",
+      ),
+    recordReason: z
+      .string()
+      .optional()
+      .describe(
+        "Optional: if you are intentionally writing the new function anyway despite the " +
+          "flagged matches, pass the reason — hydracode records a deliberate-duplicate " +
+          "decision in the memory layer so future checks know the duplication was intentional.",
+      ),
+  },
+  async ({ proposedName, targetFile, recordReason }) => {
+    if (configError || !client) return configErrorContent();
+    return safeCall(async () => {
+      const result = await checkDuplicateRisk(
+        client!,
+        proposedName,
+        targetFile !== undefined ? { targetFile } : undefined,
+      );
+      if (
+        recordReason !== undefined &&
+        result.candidates.length > 0
+      ) {
+        const recorded = await recordKnownDuplicate(
+          client!,
+          proposedName,
+          recordReason,
+          result.candidates,
+        );
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ ...result, recorded }),
+            },
+          ],
+        };
+      }
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
       };
     });
   },
