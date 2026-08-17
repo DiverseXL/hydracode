@@ -1,0 +1,251 @@
+/**
+ * Shared ask pipeline — the intent-routing and graph query logic originally
+ * inlined in src/cli.ts, extracted so both the CLI and the MCP tool call
+ * exactly one implementation.
+ *
+ * Returns structured JSON: no ANSI colour codes, no console output. The CLI
+ * renders the result with picocolors; the MCP tool serialises it as-is.
+ */
+
+import type { HydraClient } from "../hydra/client.js";
+import {
+  findByName,
+  getCallers,
+  getCallees,
+  getPathEvidence,
+  getTests,
+  parseAskQuery,
+  MAX_HOPS,
+} from "./query.js";
+import type { GraphNodeRef } from "./query.js";
+import { NODE_LABELS } from "./schema.js";
+
+/* ------------------------------------------------------------------ */
+/* Public result types                                                  */
+/* ------------------------------------------------------------------ */
+
+/** A single caller / callee / test result node. */
+export interface AskResultNode {
+  /** Logical key, e.g. `function:src/graph/writer.ts#writeExtractedFiles#45` */
+  key: string;
+  /** Friendly path segment, e.g. `src/graph/writer.ts#writeExtractedFiles` */
+  display: string;
+  /** File path stripped of the type prefix. */
+  file: string;
+  /** Start line from the key (when present). */
+  line?: number;
+}
+
+/** A rendered path from getPathEvidence. */
+export interface AskEvidencePath {
+  /** Arrow-chain of display keys, e.g. `src/a.ts#foo → src/b.ts#bar`. */
+  pathText: string;
+  weight?: number;
+}
+
+/** A candidate node when resolution is ambiguous. */
+export interface AskAmbiguousCandidate {
+  name: string;
+  key: string;
+  label: string;
+}
+
+/** Structured result returned by runAskPipeline. */
+export interface AskPipelineResult {
+  resolved: boolean;
+  /** Present when question parsed to zero identifiers. */
+  parseError?: string;
+  /** Present when resolution found >1 match for the same name. */
+  ambiguousCandidates?: AskAmbiguousCandidate[];
+  /** Present when name(s) not found in the graph. */
+  notFound?: string;
+  /** The resolved anchor node, when resolved is true. */
+  anchor?: { key: string; label: string };
+  /** Callers / callees / tests, depending on intent. */
+  results?: AskResultNode[];
+  /** path evidence chains from getPathEvidence. */
+  evidence?: AskEvidencePath[];
+  /**
+   * Human-readable summary sentence, e.g. "found 15 callers of writeExtractedFiles".
+   * Intended for the MCP tool's message field and the CLI's heading line.
+   */
+  message?: string;
+  intent?: "callers" | "callees" | "tests" | "general";
+}
+
+/* ------------------------------------------------------------------ */
+/* runAskPipeline                                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Execute the full ask pipeline:
+ *   1. Parse question → candidateNames + intent
+ *   2. Resolve names against the graph (exact match then case-insensitive)
+ *   3. Route to getCallers / getCallees / getTests / getCallees+getTests
+ *   4. Fetch path evidence for callers/callees intents
+ *
+ * Never writes to stdout. Returns a structured AskPipelineResult object;
+ * rendering (ANSI / JSON serialisation) is the caller's responsibility.
+ */
+export async function runAskPipeline(
+  client: HydraClient,
+  question: string,
+  maxHops: number = MAX_HOPS,
+): Promise<AskPipelineResult> {
+  const hops = Math.min(Math.max(1, maxHops), MAX_HOPS);
+
+  // Step 1: Heuristic parse.
+  const { candidateNames, intent } = parseAskQuery(question);
+  if (candidateNames.length === 0) {
+    return {
+      resolved: false,
+      parseError:
+        "I couldn't pick out any code identifiers from that question. " +
+        'Try naming a function or class, e.g. `ask "what calls writeExtractedFiles"`.',
+    };
+  }
+
+  // Step 2: Resolve each candidate name, most specific first.
+  const perName = new Map<string, GraphNodeRef[]>();
+  let anchor: GraphNodeRef | undefined;
+  for (const name of candidateNames) {
+    const matches = await findByName(client, name);
+    if (matches.length === 0) continue;
+    perName.set(name, matches);
+    if (anchor === undefined && matches.length === 1) {
+      anchor = matches[0];
+    }
+  }
+
+  if (anchor === undefined) {
+    const ambiguous = [...perName.entries()].filter(([, ms]) => ms.length > 1);
+    if (ambiguous.length > 0) {
+      const candidates: AskAmbiguousCandidate[] = ambiguous.flatMap(
+        ([name, matches]) =>
+          matches.map((m) => ({ name, key: m.key, label: m.label })),
+      );
+      return {
+        resolved: false,
+        ambiguousCandidates: candidates,
+        message:
+          "Multiple matches — re-ask with a more specific name (e.g. the exact function or file path).",
+      };
+    }
+    return {
+      resolved: false,
+      notFound: `Couldn't find anything named ${candidateNames.map((n) => `"${n}"`).join(" or ")} in the indexed graph — try running \`hydracode index\` first, or check the spelling.`,
+    };
+  }
+
+  // Step 3: Anchor resolved — handle the File shortcut.
+  if (anchor.label === NODE_LABELS.FILE && intent !== "general") {
+    const filePath = anchor.key.replace(/^file:/, "");
+    return {
+      resolved: true,
+      anchor: { key: anchor.key, label: anchor.label },
+      intent,
+      message: `${filePath} is a file — callers/callees are tracked per function; try naming a function inside it.`,
+      results: [],
+    };
+  }
+
+  // Step 4: Intent routing.
+  let nodes: GraphNodeRef[] = [];
+
+  if (intent === "callers") {
+    nodes = await getCallers(client, anchor.id, hops);
+  } else if (intent === "callees") {
+    nodes = await getCallees(client, anchor.id, hops);
+  } else if (intent === "tests") {
+    nodes = await getTests(client, anchor.id);
+  } else {
+    // general: callees + tests
+    const callees = await getCallees(client, anchor.id, hops);
+    const tests = await getTests(client, anchor.id);
+    nodes = [...callees, ...tests];
+  }
+
+  const results: AskResultNode[] = nodes.map(nodeRefToResult);
+
+  // Step 5: Path evidence for callers/callees.
+  const evidence: AskEvidencePath[] = [];
+  if (intent === "callers" || intent === "callees") {
+    const paths = await getPathEvidence(client, anchor.id, { maxLen: hops });
+    for (const p of paths.slice(0, 8)) {
+      if (p.parseSucceeded) {
+        evidence.push({
+          pathText: p.nodes.map((n) => chainDisplay(n.key)).join(" \u2192 "),
+          weight: p.weight,
+        });
+      }
+    }
+  }
+
+  const intentVerb =
+    intent === "callers"
+      ? "callers"
+      : intent === "callees"
+        ? "callees"
+        : intent === "tests"
+          ? "tests"
+          : "related nodes";
+
+  const anchorDisplay = describeKey(anchor.key);
+  const message =
+    results.length === 0
+      ? `no ${intentVerb} found for ${anchorDisplay}`
+      : `found ${results.length} ${intentVerb} for ${anchorDisplay}`;
+
+  return {
+    resolved: true,
+    anchor: { key: anchor.key, label: anchor.label },
+    intent,
+    results,
+    evidence,
+    message,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Key formatting helpers (pure — no rendering-library imports)        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * `function:src/a.ts#foo#12` → `src/a.ts#foo:12`
+ * `file:src/a.ts` → `src/a.ts`
+ */
+export function describeKey(key: string): string {
+  const bare = key.replace(/^(file|module|function|class|test|memory):/, "");
+  const parts = bare.split("#");
+  if (key.startsWith("function:") || key.startsWith("test:")) {
+    if (parts.length >= 3) {
+      const line = parts.pop();
+      return `${parts.join("#")}:${line}`;
+    }
+  }
+  return bare;
+}
+
+/** Strip line suffix for arrow-chain rendering: `src/a.ts#foo#12` → `src/a.ts#foo`. */
+export function chainDisplay(key: string): string {
+  const bare = key.replace(/^(file|module|function|class|test|memory):/, "");
+  const parts = bare.split("#");
+  if (key.startsWith("function:") || key.startsWith("test:")) {
+    parts.pop();
+  }
+  return parts.join("#");
+}
+
+/** Map a GraphNodeRef to an AskResultNode. */
+function nodeRefToResult(ref: GraphNodeRef): AskResultNode {
+  const display = describeKey(ref.key);
+  const bare = ref.key.replace(/^(file|module|function|class|test|memory):/, "");
+  const file = bare.split("#")[0] ?? bare;
+  const parts = bare.split("#");
+  const lastPart = parts[parts.length - 1];
+  const line =
+    parts.length >= 3 && lastPart !== undefined && /^\d+$/.test(lastPart)
+      ? parseInt(lastPart, 10)
+      : undefined;
+  return { key: ref.key, display, file, line };
+}

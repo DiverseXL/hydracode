@@ -32,23 +32,33 @@ export class HydraClient {
    *   Authorization: Bearer {token}
    *   X-Graph-Namespace: {namespace}
    *   Content-Type: application/json
-   *   { "cell_id": ..., "query": ..., "consistency": "causal" | "strong" }
+   *   { "cell_id": ..., "query": ..., "parameters": {...}, "consistency": "causal" | "strong" }
+   *
+   * `parameters` is sent as a plain nested-JSON object in the request body's
+   * `parameters` field — no escaping, no transformation. This is the
+   * CONFIRMED real shape (HydraDB src/client/http.rs,
+   * HttpQueryRequestBody: `parameters: BTreeMap<String, serde_json::Value>`),
+   * which accepts lists of maps (e.g. a `$rows` batch for UNWIND writes) as
+   * well as scalars; values are never inlined into the query text.
    *
    * Throws HydraQueryError on non-2xx responses and HydraConnectionError on
    * network failures, so callers can give different guidance for each.
    */
   async query(
     cypher: string,
-    params?: Record<string, unknown>,
+    parameters?: Record<string, unknown>,
     opts?: HydraQueryOptions,
   ): Promise<HydraQueryResult> {
     const url = `${this.baseUri()}/v1/graphs/${encodeURIComponent(this.config.graph)}/query`;
 
-    const body = {
+    const body: Record<string, unknown> = {
       cell_id: this.config.cellId,
-      query: inlineParams(cypher, params),
+      query: cypher,
       consistency: opts?.consistency ?? "causal",
     };
+    if (parameters !== undefined && Object.keys(parameters).length > 0) {
+      body.parameters = parameters;
+    }
 
     let res: Response;
     try {
@@ -122,38 +132,10 @@ export class HydraClient {
 }
 
 /**
- * Inline query parameters as escaped OpenCypher literals.
- *
- * NOTE: HydraDB's OpenCypher subset does not document parameter binding
- * (e.g. `$param`) in the project README, so we cannot assume it is
- * supported. To stay safe, queries reference params as `$name` and this
- * helper substitutes the *escaped literal value* directly into the query
- * string, using the shared escapeCypherScalar escaper (also used by
- * graph/writer.ts to build literal Cypher without native binding).
- *
- * TODO: switch to native parameter binding once confirmed against a running
- * HydraDB instance.
- */
-function inlineParams(
-  cypher: string,
-  params?: Record<string, unknown>,
-): string {
-  if (!params || Object.keys(params).length === 0) return cypher;
-
-  return cypher.replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (_match, name: string) => {
-    if (!Object.prototype.hasOwnProperty.call(params, name)) {
-      throw new Error(
-        `Query references parameter $${name} but no value was provided.`,
-      );
-    }
-    return escapeCypherScalar(params[name]);
-  });
-}
-
-/**
- * Escape a single scalar value as an OpenCypher literal, for safe inlining
- * into a query string. Exported so graph/writer.ts can build literal Cypher
- * from node/edge properties without native parameter binding.
+ * Escape a single scalar value as an OpenCypher literal, for callers that
+ * need a literal scalar directly in query text (e.g. a LIMIT value or a
+ * static filter). query() no longer uses this internally — parameters now
+ * travel via the request body's `parameters` field, untouched.
  *
  * Rejects exactly what it always has: objects (only flat scalars and arrays
  * of those are supported), non-finite numbers, and undefined/symbol/function

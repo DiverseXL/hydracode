@@ -15,10 +15,20 @@
  * - Tests: only leaf cases with a string-literal name (`it`/`test`/`it.only`
  *   /`it.skip`/`test.only`/`test.skip`). Nested describe context is NOT
  *   captured in the test name.
- * - Call edges: only plain-Identifier callees (`foo()`) and `this.foo()`
- *   are captured. Method calls on other objects (`obj.method()`) and
- *   computed calls are skipped — this under-counts real call edges,
- *   especially cross-object method calls.
+ * - Call edges: captured via a heuristic, single-file, no-type-checker AST
+ *   pass:
+ *   - Plain identifier calls (`foo()`), kind "plain".
+ *   - `this.foo()` calls, kind "this".
+ *   - `obj.method()` cross-object calls, kind "member", with in-file
+ *     calleeClassHint extracted syntactically when `obj` is an Identifier
+ *     declared via `new ClassName(...)` or with an explicit type annotation
+ *     `(param: ClassName)`.
+ *   - Calls on common global/builtin namespaces (Math, JSON, console, Object,
+ *     Array, Promise, process, Buffer) are skipped to avoid noise.
+ *   - Calls through untyped parameters, destructured objects, dynamically
+ *     returned instances, and complex expressions (e.g. `getObj().method()`,
+ *     `a.b.c()`) have no hint and will rely on name matching or stay unresolved.
+ *   - Computed calls (`obj[key]()`) are skipped.
  * - Re-exports (`export ... from`) and dynamic `import()` are not tracked.
  * - .gitignore is not parsed yet; extraction uses hardcoded excludes
  *   (node_modules, dist, .git, .hydracode).
@@ -48,8 +58,14 @@ export interface ExtractedImport {
 export interface ExtractedCall {
   callerId: string;
   calleeName: string;
-  /** "identifier" for plain foo() calls; "this" for this.foo() calls. */
-  kind?: "identifier" | "this";
+  /**
+   * "plain" for plain foo() calls;
+   * "this" for this.foo() calls;
+   * "member" for obj.method() calls.
+   */
+  kind?: "plain" | "this" | "member";
+  /** In-file syntactic class name hint (e.g. "HydraClient" from `const c = new HydraClient()` or `(c: HydraClient)`). */
+  calleeClassHint?: string;
 }
 
 export interface ExtractedMethodOf {
@@ -258,6 +274,7 @@ export async function extractFile(
           callerId: funcStack[funcStack.length - 1],
           calleeName: callee.name,
           kind: callee.kind,
+          calleeClassHint: callee.calleeClassHint,
         });
       }
     }
@@ -428,25 +445,228 @@ function testCaseName(call: ts.CallExpression): string | undefined {
     : undefined;
 }
 
+const GLOBAL_BUILTIN_NAMESPACES = new Set([
+  "Math",
+  "JSON",
+  "console",
+  "Object",
+  "Array",
+  "Promise",
+  "process",
+  "Buffer",
+]);
+
+function extractTypeNameFromTypeNode(typeNode: ts.TypeNode): string | undefined {
+  if (ts.isTypeReferenceNode(typeNode)) {
+    if (ts.isIdentifier(typeNode.typeName)) {
+      return typeNode.typeName.text;
+    }
+    if (ts.isQualifiedName(typeNode.typeName)) {
+      return typeNode.typeName.right.text;
+    }
+  } else if (ts.isUnionTypeNode(typeNode)) {
+    for (const t of typeNode.types) {
+      const name = extractTypeNameFromTypeNode(t);
+      if (name && name !== "undefined" && name !== "null") {
+        return name;
+      }
+    }
+  }
+  return undefined;
+}
+
+function extractClassNameFromExpression(expr: ts.Expression): string | undefined {
+  let cur: ts.Expression = expr;
+  while (true) {
+    if (ts.isParenthesizedExpression(cur)) {
+      cur = cur.expression;
+    } else if (ts.isNonNullExpression(cur)) {
+      cur = cur.expression;
+    } else if (ts.isAsExpression(cur)) {
+      const typeName = extractTypeNameFromTypeNode(cur.type);
+      if (typeName) return typeName;
+      cur = cur.expression;
+    } else if (ts.isTypeAssertionExpression(cur)) {
+      const typeName = extractTypeNameFromTypeNode(cur.type);
+      if (typeName) return typeName;
+      cur = cur.expression;
+    } else if (ts.isAwaitExpression(cur)) {
+      cur = cur.expression;
+    } else {
+      break;
+    }
+  }
+
+  if (ts.isNewExpression(cur)) {
+    const callee = cur.expression;
+    if (ts.isIdentifier(callee)) {
+      return callee.text;
+    }
+    if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.name)) {
+      return callee.name.text;
+    }
+  }
+  return undefined;
+}
+
+function extractClassHintFromDeclaration(decl: ts.Node): string | undefined {
+  if (ts.isVariableDeclaration(decl)) {
+    if (decl.initializer) {
+      const fromInit = extractClassNameFromExpression(decl.initializer);
+      if (fromInit) return fromInit;
+    }
+    if (decl.type) {
+      const fromType = extractTypeNameFromTypeNode(decl.type);
+      if (fromType) return fromType;
+    }
+  } else if (ts.isParameter(decl)) {
+    if (decl.type) {
+      const fromType = extractTypeNameFromTypeNode(decl.type);
+      if (fromType) return fromType;
+    }
+    if (decl.initializer) {
+      const fromInit = extractClassNameFromExpression(decl.initializer);
+      if (fromInit) return fromInit;
+    }
+  } else if (ts.isPropertyDeclaration(decl)) {
+    if (decl.type) {
+      const fromType = extractTypeNameFromTypeNode(decl.type);
+      if (fromType) return fromType;
+    }
+    if (decl.initializer) {
+      const fromInit = extractClassNameFromExpression(decl.initializer);
+      if (fromInit) return fromInit;
+    }
+  }
+  return undefined;
+}
+
 /**
- * Call callee detection. Captures plain-Identifier callees (`foo()`) and
- * `this.foo()` (PropertyAccess on `this`), tagged as kind "this" so the
- * writer can prefer resolving those against the same class's methods.
- * `obj.method()` and computed calls are skipped (documented limitation).
+ * Syntactic in-file class hint resolution: looks up the declaration of `obj`
+ * within the enclosing AST scopes (parameters, local variable declarations,
+ * class properties) in the same file. Returns the plain text name of the
+ * constructed class (`new ClassName()`) or annotated type (`(x: ClassName)`),
+ * or undefined if not determinable. No type checker or cross-file lookup.
+ */
+function findClassHint(obj: ts.Identifier): string | undefined {
+  const targetName = obj.text;
+  let cur: ts.Node | undefined = obj.parent;
+
+  while (cur) {
+    // 1. Function / Method / Arrow / Constructor parameters
+    if (
+      ts.isFunctionDeclaration(cur) ||
+      ts.isFunctionExpression(cur) ||
+      ts.isArrowFunction(cur) ||
+      ts.isMethodDeclaration(cur) ||
+      ts.isConstructorDeclaration(cur) ||
+      ts.isGetAccessorDeclaration(cur) ||
+      ts.isSetAccessorDeclaration(cur)
+    ) {
+      for (const param of cur.parameters) {
+        if (ts.isIdentifier(param.name) && param.name.text === targetName) {
+          const hint = extractClassHintFromDeclaration(param);
+          if (hint) return hint;
+        }
+      }
+    }
+
+    // 2. Block / SourceFile statements (variable statements)
+    if (
+      ts.isBlock(cur) ||
+      ts.isSourceFile(cur) ||
+      ts.isCaseClause(cur) ||
+      ts.isDefaultClause(cur)
+    ) {
+      for (const stmt of cur.statements) {
+        if (ts.isVariableStatement(stmt)) {
+          for (const decl of stmt.declarationList.declarations) {
+            if (ts.isIdentifier(decl.name) && decl.name.text === targetName) {
+              const hint = extractClassHintFromDeclaration(decl);
+              if (hint) return hint;
+            }
+          }
+        }
+      }
+    }
+
+    // 3. For statements
+    if (
+      ts.isForStatement(cur) ||
+      ts.isForInStatement(cur) ||
+      ts.isForOfStatement(cur)
+    ) {
+      if (cur.initializer && ts.isVariableDeclarationList(cur.initializer)) {
+        for (const decl of cur.initializer.declarations) {
+          if (ts.isIdentifier(decl.name) && decl.name.text === targetName) {
+            const hint = extractClassHintFromDeclaration(decl);
+            if (hint) return hint;
+          }
+        }
+      }
+    }
+
+    // 4. Class declarations / expressions
+    if (ts.isClassDeclaration(cur) || ts.isClassExpression(cur)) {
+      for (const member of cur.members) {
+        if (
+          ts.isPropertyDeclaration(member) &&
+          ts.isIdentifier(member.name) &&
+          member.name.text === targetName
+        ) {
+          const hint = extractClassHintFromDeclaration(member);
+          if (hint) return hint;
+        }
+      }
+    }
+
+    cur = cur.parent;
+  }
+
+  return undefined;
+}
+
+/**
+ * Call callee detection.
+ *
+ * Captures:
+ * - plain-Identifier callees (`foo()`), kind "plain";
+ * - `this.foo()`, kind "this" (writer resolves against the caller's class);
+ * - `obj.method()` calls, kind "member", with syntactic in-file calleeClassHint
+ *   when obj is an Identifier (`new ClassName(...)` or `(x: ClassName)`).
+ *   Common global/builtin namespaces (Math, JSON, console, Object, Array,
+ *   Promise, process, Buffer) are skipped.
+ * Computed calls (`obj[key]()`) and complex expressions without hints are
+ * handled as documented.
  */
 function callCallee(
   call: ts.CallExpression,
-): { name: string; kind: "identifier" | "this" } | undefined {
+): { name: string; kind: "plain" | "this" | "member"; calleeClassHint?: string } | undefined {
   const expr = call.expression;
   if (ts.isIdentifier(expr)) {
-    return { name: expr.text, kind: "identifier" };
+    return { name: expr.text, kind: "plain" };
   }
-  if (
-    ts.isPropertyAccessExpression(expr) &&
-    expr.expression.kind === ts.SyntaxKind.ThisKeyword &&
-    ts.isIdentifier(expr.name)
-  ) {
-    return { name: expr.name.text, kind: "this" };
+  if (ts.isPropertyAccessExpression(expr) && ts.isIdentifier(expr.name)) {
+    if (expr.expression.kind === ts.SyntaxKind.ThisKeyword) {
+      return { name: expr.name.text, kind: "this" };
+    }
+    if (ts.isIdentifier(expr.expression)) {
+      const objName = expr.expression.text;
+      if (GLOBAL_BUILTIN_NAMESPACES.has(objName)) {
+        return undefined;
+      }
+      const hint = findClassHint(expr.expression);
+      return {
+        name: expr.name.text,
+        kind: "member",
+        calleeClassHint: hint,
+      };
+    }
+    return {
+      name: expr.name.text,
+      kind: "member",
+      calleeClassHint: undefined,
+    };
   }
   return undefined;
 }
