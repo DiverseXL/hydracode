@@ -409,3 +409,4 @@ void (undefined as unknown as AskEvidencePath);
 // test hook 3
 // test hook 4
 // test hook 5
+// test hook 6
