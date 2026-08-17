@@ -336,7 +336,8 @@ program
       return;
     }
     
-    const cliPath = fileURLToPath(import.meta.url);
+    const repoRoot = process.cwd();
+    const cliPath = path.join(repoRoot, "dist", "cli.js");
     const nodeExec = process.execPath;
     
     const gitDir = execSync("git rev-parse --git-dir", { encoding: "utf8" }).trim();
@@ -404,3 +405,4 @@ function printResultList(label: string, nodes: AskResultNode[], maxHops: number)
 
 // Suppress unused-import warning for AskEvidencePath (used only as type annotation).
 void (undefined as unknown as AskEvidencePath);
+// test hook
