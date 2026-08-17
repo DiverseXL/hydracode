@@ -356,7 +356,7 @@ program
     
     const hookBlock = `
 # >>> hydracode post-commit >>>
-( "${nodeExec.replace(/\\/g, '/')}" "${cliPath.replace(/\\/g, '/')}" index . --changed-only > .git/hydracode-reindex.log 2>&1 & )
+( node "${cliPath.replace(/\\/g, '/')}" index --changed-only > .git/hydracode-reindex.log 2>&1 & )
 # <<< hydracode post-commit <<<
 `;
     fs.writeFileSync(hookPath, hookContent + hookBlock);
@@ -406,3 +406,4 @@ function printResultList(label: string, nodes: AskResultNode[], maxHops: number)
 // Suppress unused-import warning for AskEvidencePath (used only as type annotation).
 void (undefined as unknown as AskEvidencePath);
 // test hook
+// test hook 3
