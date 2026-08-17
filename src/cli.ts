@@ -356,7 +356,8 @@ program
     
     const hookBlock = `
 # >>> hydracode post-commit >>>
-( node "${cliPath.replace(/\\/g, '/')}" index --changed-only > .git/hydracode-reindex.log 2>&1 & )
+# Runs synchronously (~400ms). Fails silently if hydracode is unavailable.
+node "${cliPath.replace(/\\/g, '/')}" index --changed-only >> .git/hydracode-reindex.log 2>&1 || true
 # <<< hydracode post-commit <<<
 `;
     fs.writeFileSync(hookPath, hookContent + hookBlock);
@@ -411,3 +412,4 @@ void (undefined as unknown as AskEvidencePath);
 // test hook 5
 // test hook 6
 // test hook 7
+// final test
