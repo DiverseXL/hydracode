@@ -32,6 +32,7 @@ import {
   recallMemoryFacts,
   recordKnownDuplicate,
   recordMemoryFactAbout,
+  listMemoryFacts,
 } from "../memory/store.js";
 import { writeExtractedFiles } from "../graph/writer.js";
 import { HydraClient } from "../hydra/client.js";
@@ -291,7 +292,9 @@ server.tool(
   "Record a project decision, convention, or rationale so future sessions (yours or " +
     "another agent's) can recall why something was done a certain way. Use this after " +
     "making a non-obvious choice — e.g. picking one approach over another, or deciding " +
-    "not to fix something yet.",
+    "not to fix something yet. Optionally pass supersedesKey to explicitly mark an older " +
+    "decision as replaced by this one — the old fact is marked superseded and will no " +
+    "longer appear in normal memory recall.",
   {
     text: z
       .string()
@@ -303,13 +306,30 @@ server.tool(
         "Optional: name of a function, class, or file to link this fact to via an ABOUT edge " +
           "(resolved against the indexed graph; use the exact qualified name or file path).",
       ),
+    supersedesKey: z
+      .string()
+      .optional()
+      .describe(
+        "Optional: key of an older MemoryFact that this one replaces. Can be the full " +
+          "UUID form (memory:...) or just the UUID portion. The old fact is marked superseded " +
+          "and will no longer appear in normal memory recall.",
+      ),
   },
-  async ({ text, about }) => {
+  async ({ text, about, supersedesKey }) => {
     if (configError || !client) return configErrorContent();
     return safeCall(async () => {
-      const { recorded } = await recordMemoryFactAbout(client!, text, about);
+      const { recorded, superseded } = await recordMemoryFactAbout(
+        client!,
+        text,
+        about,
+        supersedesKey,
+      );
+      const response: Record<string, unknown> = { recorded };
+      if (superseded) {
+        response.superseded = superseded;
+      }
       return {
-        content: [{ type: "text", text: JSON.stringify({ recorded }) }],
+        content: [{ type: "text", text: JSON.stringify(response) }],
       };
     });
   },
@@ -344,6 +364,33 @@ server.tool(
       const facts = await recallMemoryFacts(client!, { query, about });
       return {
         content: [{ type: "text", text: JSON.stringify({ facts }) }],
+      };
+    });
+  },
+);
+
+server.tool(
+  "hydracode_list_memory",
+  "List all active memory facts recorded for this project, grouped by the code they concern. " +
+    "Use this to check what decisions and conventions have already been recorded before making " +
+    "an architectural choice or recording a new fact.",
+  {
+    includeSuperseded: z
+      .boolean()
+      .optional()
+      .describe("Optional: include superseded facts in a separate section (default: false)"),
+  },
+  async ({ includeSuperseded }) => {
+    if (configError || !client) return configErrorContent();
+    return safeCall(async () => {
+      const facts = await listMemoryFacts(client!, { includeSuperseded });
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ facts, total: facts.length }),
+          },
+        ],
       };
     });
   },

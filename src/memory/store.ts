@@ -42,6 +42,8 @@ export interface RecordMemoryFactOptions {
   about?: { key: string; label: NodeLabel }[];
   trust?: number;
   status?: MemoryFactStatus;
+  /** Optional: key of an older MemoryFact that this fact supersedes. */
+  supersedesKey?: string;
 }
 
 /* ------------------------- Cypher body templates ------------------------- */
@@ -54,21 +56,52 @@ const aboutBody = (targetLabel: NodeLabel): string =>
 MERGE (a)-[r:${REL_TYPES.ABOUT} {id: row.edgeId}]->(b)
 SET r.key = row.edgeKey`;
 
+const supersededByBody = `MATCH (old:${NODE_LABELS.MEMORY_FACT} {id: row.oldId}), (new:${NODE_LABELS.MEMORY_FACT} {id: row.newId})
+MERGE (old)-[r:${REL_TYPES.SUPERSEDED_BY} {id: row.edgeId}]->(new)
+SET r.key = row.edgeKey`;
+
 /* ------------------------------ record ---------------------------------- */
 
 /**
  * Write one MemoryFact node (and optional ABOUT edges) to the graph.
  * Idempotent per fact key: a fresh `memory:<uuid>` key means every call
  * records a distinct fact (this is a log of decisions, not a upsert).
+ * 
+ * If supersedesKey is provided, the old fact is marked as "superseded" and
+ * a SUPERSEDED_BY edge is created from old to new. The old fact must exist.
  */
 export async function recordMemoryFact(
   client: HydraClient,
   opts: RecordMemoryFactOptions,
-): Promise<MemoryFactRef> {
+): Promise<{ fact: MemoryFactRef; superseded?: MemoryFactRef }> {
   const createdAt = new Date().toISOString();
   const trust = opts.trust ?? 1;
   const status = opts.status ?? "active";
   const key = `memory:${randomUUID()}`;
+
+  // Resolve the old fact if supersedesKey is provided
+  let oldFactData: { key: string; text: string; createdAt: string } | undefined;
+  if (opts.supersedesKey) {
+    const normalizedOldKey = opts.supersedesKey.startsWith("memory:")
+      ? opts.supersedesKey
+      : `memory:${opts.supersedesKey}`;
+    const res = await client.query(
+      `MATCH (m:${NODE_LABELS.MEMORY_FACT} {key: $key}) RETURN m.key AS key, m.text AS text, m.createdAt AS createdAt`,
+      { key: normalizedOldKey },
+      { consistency: "strong" },
+    );
+    if (res.rows.length === 0) {
+      throw new Error(
+        `No MemoryFact found with key "${normalizedOldKey}" — cannot supersede a fact that doesn't exist.`,
+      );
+    }
+    const cells = rowCells(res.rows[0]);
+    oldFactData = {
+      key: cellStr(cells[0]),
+      text: cellStr(cells[1]),
+      createdAt: cellStr(cells[2]),
+    };
+  }
 
   const factRow = {
     id: hashToVertexId(key),
@@ -107,7 +140,42 @@ export async function recordMemoryFact(
     );
   }
 
-  return { key, text: opts.text, createdAt };
+  // If supersedesKey was provided, write SUPERSEDED_BY edge and update old fact's status
+  if (oldFactData) {
+    const oldId = hashToVertexId(oldFactData.key);
+    const newId = hashToVertexId(key);
+    const edgeKey = `${oldFactData.key}->${REL_TYPES.SUPERSEDED_BY}->${key}`;
+    const edgeId = hashToVertexId(edgeKey);
+
+    // Update the old fact's status to "superseded" - use direct MATCH SET without UNWIND
+    await client.query(
+      `MATCH (m:${NODE_LABELS.MEMORY_FACT} {id: $id})
+SET m.status = $status`,
+      { id: oldId, status: "superseded" },
+      { consistency: "strong" },
+    );
+
+    // Write the SUPERSEDED_BY edge (following the same pattern as ABOUT edges)
+    await client.query(
+      `UNWIND $rows AS row\n${supersededByBody}`,
+      {
+        rows: [
+          {
+            oldId,
+            newId,
+            edgeId,
+            edgeKey,
+          },
+        ],
+      },
+      { consistency: "strong" },
+    );
+  }
+
+  return {
+    fact: { key, text: opts.text, createdAt },
+    superseded: oldFactData,
+  };
 }
 
 /**
@@ -129,7 +197,12 @@ export async function recordMemoryFactAbout(
   client: HydraClient,
   text: string,
   aboutName?: string,
-): Promise<{ recorded: MemoryFactRef; about: { key: string; label: NodeLabel }[] }> {
+  supersedesKey?: string,
+): Promise<{
+  recorded: MemoryFactRef;
+  superseded?: MemoryFactRef;
+  about: { key: string; label: NodeLabel }[];
+}> {
   let about: { key: string; label: NodeLabel }[] = [];
   const name = aboutName?.trim() ?? "";
   if (name.length > 0) {
@@ -148,8 +221,8 @@ export async function recordMemoryFactAbout(
     }
     about = [{ key: matches[0].key, label: matches[0].label }];
   }
-  const recorded = await recordMemoryFact(client, { text, about });
-  return { recorded, about };
+  const result = await recordMemoryFact(client, { text, about, supersedesKey });
+  return { recorded: result.fact, superseded: result.superseded, about };
 }
 
 /* ------------------------------ recall ---------------------------------- */
@@ -295,6 +368,105 @@ export async function recallMemoryFacts(
   return factRows.map((f) => ({ ...f, about: aboutByFact.get(f.key) ?? [] }));
 }
 
+/** One listed memory fact with full details. */
+export interface ListedMemoryFact {
+  key: string;
+  text: string;
+  createdAt: string;
+  status: MemoryFactStatus;
+  trust: number;
+  /** keys of nodes this fact is ABOUT (empty array if unlinked) */
+  about: string[];
+  /** key of the superseding fact, if this one is superseded */
+  supersededBy?: string;
+}
+
+/**
+ * List all MemoryFact nodes, optionally including superseded ones.
+ * Groups ABOUT relationships for efficient batched queries.
+ */
+export async function listMemoryFacts(
+	client: HydraClient,
+	opts?: { includeSuperseded?: boolean },
+): Promise<ListedMemoryFact[]> {
+	// Fetch all facts filtered by status
+	const statusFilter = opts?.includeSuperseded ? "" : "WHERE m.status = 'active'";
+	const res = await client.query(
+		`MATCH (m:${NODE_LABELS.MEMORY_FACT}) ${statusFilter} RETURN m.id AS id, m.key AS key, m.text AS text, m.createdAt AS createdAt, m.status AS status, m.trust AS trust ORDER BY m.createdAt DESC`,
+		undefined,
+		{ consistency: "strong" },
+	);
+
+	const facts: ListedMemoryFact[] = [];
+	const factKeyById = new Map<string, ListedMemoryFact>();
+
+	for (const row of res.rows) {
+		const cells = rowCells(row);
+		const id = cellStr(cells[0]);
+		const key = cellStr(cells[1]);
+		if (key === "" || id === "") continue;
+
+		const fact: ListedMemoryFact = {
+			key,
+			text: cellStr(cells[2]),
+			createdAt: cellStr(cells[3]),
+			status: (cellStr(cells[4]) as MemoryFactStatus) || "active",
+			trust: Number(unwrapValue(cells[5])) || 1.0,
+			about: [],
+		};
+		facts.push(fact);
+		factKeyById.set(id, fact);
+	}
+
+	if (facts.length === 0) return [];
+
+	// Fetch all ABOUT targets for all facts in a single query
+	const aboutRes = await client.query(
+		`MATCH (m:${NODE_LABELS.MEMORY_FACT})-[:${REL_TYPES.ABOUT}]->(t)
+RETURN m.id AS factId, t.key AS targetKey`,
+		undefined,
+		{ consistency: "strong" },
+	);
+
+	const aboutByFactId = new Map<string, string[]>();
+	for (const row of aboutRes.rows) {
+		const cells = rowCells(row);
+		const factId = cellStr(cells[0]);
+		const targetKey = cellStr(cells[1]);
+		if (factId === "" || targetKey === "") continue;
+		const list = aboutByFactId.get(factId) ?? [];
+		if (!list.includes(targetKey)) list.push(targetKey);
+		aboutByFactId.set(factId, list);
+	}
+
+	// Assign ABOUT targets to facts
+	for (const [factId, aboutList] of aboutByFactId) {
+		const fact = factKeyById.get(factId);
+		if (fact) fact.about = aboutList;
+	}
+
+	// If includeSuperseded, also fetch SUPERSEDED_BY edges
+	if (opts?.includeSuperseded) {
+		const superRes = await client.query(
+			`MATCH (m:${NODE_LABELS.MEMORY_FACT})-[:${REL_TYPES.SUPERSEDED_BY}]->(newer:${NODE_LABELS.MEMORY_FACT})
+RETURN m.id AS factId, newer.key AS newerKey`,
+			undefined,
+			{ consistency: "strong" },
+		);
+
+		for (const row of superRes.rows) {
+			const cells = rowCells(row);
+			const factId = cellStr(cells[0]);
+			const newerKey = cellStr(cells[1]);
+			if (factId === "" || newerKey === "") continue;
+			const fact = factKeyById.get(factId);
+			if (fact) fact.supersededBy = newerKey;
+		}
+	}
+
+	return facts;
+}
+
 export async function recordKnownDuplicate(
   client: HydraClient,
   proposedName: string,
@@ -314,8 +486,9 @@ export async function recordKnownDuplicate(
     `Reason: ${reason.trim().length > 0 ? reason.trim() : "not given"}. ` +
     `Recorded via hydracode check-duplicate --record.`;
 
-  return recordMemoryFact(client, {
+  const result = await recordMemoryFact(client, {
     text,
     about: candidates.map((c) => ({ key: c.key, label: NODE_LABELS.FUNCTION })),
   });
+  return result.fact;
 }

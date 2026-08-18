@@ -15,7 +15,7 @@ import { runInstall } from "./install.js";
 import { getGraphStatus, MAX_HOPS } from "./graph/query.js";
 import { buildGraphSummary, renderAgentsMdSection, MARKER_START, MARKER_END } from "./graph/agentsSummary.js";
 import { checkDuplicateRisk, functionNameFromKey } from "./graph/duplicateCheck.js";
-import { recordKnownDuplicate, recordMemoryFactAbout, recallMemoryFacts } from "./memory/store.js";
+import { recordKnownDuplicate, recordMemoryFactAbout, recallMemoryFacts, listMemoryFacts } from "./memory/store.js";
 import { writeExtractedFiles } from "./graph/writer.js";
 import { HydraClient } from "./hydra/client.js";
 import { HydraConnectionError, HydraQueryError } from "./hydra/errors.js";
@@ -292,7 +292,8 @@ memoryCmd
   .description("Record a project decision, convention, or rationale in the memory layer")
   .argument("<text>", "the decision/note text to record")
   .option("--about <name>", "function/class/file name to link this fact to via ABOUT")
-  .action(async (text: string, opts: { about?: string }) => {
+  .option("--supersedes <fact-key>", "optional: key of an older fact that this one replaces (mark old as superseded)")
+  .action(async (text: string, opts: { about?: string; supersedes?: string }) => {
     try {
       const config = loadConfig();
       const client = new HydraClient(config);
@@ -300,12 +301,23 @@ memoryCmd
       console.log(pc.bold("hydracode memory record"));
       console.log();
 
-      const { recorded, about } = await recordMemoryFactAbout(client, text, opts.about);
-      console.log(pc.green(`Recorded: ${recorded.key}`));
+      const { recorded, superseded, about } = await recordMemoryFactAbout(
+        client,
+        text,
+        opts.about,
+        opts.supersedes,
+      );
+      console.log(pc.green(`✓ recorded`), pc.bold(recorded.key));
       console.log(pc.dim(`  ${recorded.text}`));
       console.log(pc.dim(`  createdAt: ${recorded.createdAt}`));
       if (about.length > 0) {
         console.log(pc.dim(`  about: ${about.map((a) => a.key).join(", ")}`));
+      }
+      if (superseded) {
+        console.log();
+        console.log(pc.green(`↳ supersedes`), pc.bold(superseded.key));
+        console.log(pc.dim(`  ${superseded.text}`));
+        console.log(pc.dim(`  (status updated to: superseded)`));
       }
     } catch (err) {
       if (err instanceof HydraConnectionError) {
@@ -346,6 +358,108 @@ memoryCmd
           if (f.about.length > 0) {
             console.log(pc.dim(`    about: ${f.about.join(", ")}`));
           }
+        }
+      }
+    } catch (err) {
+      if (err instanceof HydraConnectionError) {
+        console.error(pc.red(`\nerror: ${err.message}`));
+      } else if (err instanceof HydraQueryError) {
+        console.error(
+          pc.red(`\nerror: HydraDB rejected a query (HTTP ${err.status}): ${err.body}`),
+        );
+      } else {
+        console.error(pc.red(`\nerror: ${err instanceof Error ? err.message : String(err)}`));
+      }
+      process.exitCode = 1;
+    }
+  });
+
+memoryCmd
+  .command("list")
+  .description("List all active memory facts, grouped by what they concern")
+  .option("--all", "include superseded facts in a separate section")
+  .action(async (opts: { all?: boolean }) => {
+    try {
+      const config = loadConfig();
+      const client = new HydraClient(config);
+
+      console.log(pc.bold("hydracode memory list"));
+      console.log();
+
+      const facts = await listMemoryFacts(client, { includeSuperseded: opts.all });
+      if (facts.length === 0) {
+        console.log(pc.dim("No memory facts recorded yet. Use `hydracode memory record` to add one."));
+        return;
+      }
+
+      // Group facts by status and then by ABOUT target
+      const activeFacts = facts.filter((f) => f.status === "active");
+      const supersededFacts = facts.filter((f) => f.status === "superseded");
+
+      // Group active facts by ABOUT target
+      const byAbout = new Map<string, typeof activeFacts>();
+      const unlinked: typeof activeFacts = [];
+
+      for (const f of activeFacts) {
+        if (f.about.length === 0) {
+          unlinked.push(f);
+        } else {
+          for (const target of f.about) {
+            if (!byAbout.has(target)) byAbout.set(target, []);
+            byAbout.get(target)!.push(f);
+          }
+        }
+      }
+
+      console.log(pc.dim(`Active memory facts (${activeFacts.length})`));
+      console.log();
+
+      // Sort and render ABOUT-linked facts
+      const sortedTargets = Array.from(byAbout.keys()).sort();
+      for (const target of sortedTargets) {
+        console.log(pc.dim(`── linked to ${target} ──`));
+        for (const f of byAbout.get(target)!) {
+          const shortKey = f.key.replace("memory:", "").substring(0, 8);
+          const dateStr = f.createdAt.split("T")[0];
+          console.log(
+            `${pc.green(`• memory:${shortKey}`)}  ${pc.dim(`"${f.text.substring(0, 50)}${f.text.length > 50 ? "…" : ""}"`)}`
+          );
+          console.log(
+            pc.dim(`  recorded ${dateStr} · trust ${f.trust.toFixed(1)}`),
+          );
+        }
+        console.log();
+      }
+
+      // Render unlinked facts
+      if (unlinked.length > 0) {
+        console.log(pc.dim("── unlinked ──"));
+        for (const f of unlinked) {
+          const shortKey = f.key.replace("memory:", "").substring(0, 8);
+          const dateStr = f.createdAt.split("T")[0];
+          console.log(
+            `${pc.green(`• memory:${shortKey}`)}  ${pc.dim(`"${f.text.substring(0, 50)}${f.text.length > 50 ? "…" : ""}"`)}`
+          );
+          console.log(
+            pc.dim(`  recorded ${dateStr} · trust ${f.trust.toFixed(1)}`),
+          );
+        }
+        console.log();
+      }
+
+      // Render superseded facts if --all
+      if (opts.all && supersededFacts.length > 0) {
+        console.log(pc.dim("── superseded ──"));
+        for (const f of supersededFacts) {
+          const shortKey = f.key.replace("memory:", "").substring(0, 8);
+          const dateStr = f.createdAt.split("T")[0];
+          const supersedesRef = f.supersededBy ? ` ${pc.dim(`[superseded by memory:${f.supersededBy.replace("memory:", "").substring(0, 8)}]`)}` : "";
+          console.log(
+            `${pc.dim(`• memory:${shortKey}`)}  ${pc.dim(`"${f.text.substring(0, 50)}${f.text.length > 50 ? "…" : ""}"${supersedesRef}`)}`
+          );
+          console.log(
+            pc.dim(`  recorded ${dateStr} · trust ${f.trust.toFixed(1)}`),
+          );
         }
       }
     } catch (err) {

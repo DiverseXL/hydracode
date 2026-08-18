@@ -19,6 +19,7 @@ import {
   recallMemoryFacts,
   recordKnownDuplicate,
   recordMemoryFactAbout,
+  listMemoryFacts,
 } from "../src/memory/store.js";
 import { extractRepo } from "../src/extract/tsExtractor.js";
 import { writeExtractedFiles } from "../src/graph/writer.js";
@@ -102,11 +103,16 @@ server.tool(
   {
     text: z.string(),
     about: z.string().optional(),
+    supersedesKey: z.string().optional(),
   },
-  async ({ text, about }) => {
+  async ({ text, about, supersedesKey }) => {
     if (!client_) return configErrorContent();
-    const { recorded } = await recordMemoryFactAbout(client_!, text, about);
-    return { content: [{ type: "text" as const, text: JSON.stringify({ recorded }) }] };
+    const { recorded, superseded } = await recordMemoryFactAbout(client_!, text, about, supersedesKey);
+    const response: Record<string, unknown> = { recorded };
+    if (superseded) {
+      response.superseded = superseded;
+    }
+    return { content: [{ type: "text" as const, text: JSON.stringify(response) }] };
   },
 );
 
@@ -120,6 +126,18 @@ server.tool(
     if (!client_) return configErrorContent();
     const facts = await recallMemoryFacts(client_!, { query, about });
     return { content: [{ type: "text" as const, text: JSON.stringify({ facts }) }] };
+  },
+);
+
+server.tool(
+  "hydracode_list_memory",
+  {
+    includeSuperseded: z.boolean().optional(),
+  },
+  async ({ includeSuperseded }) => {
+    if (!client_) return configErrorContent();
+    const facts = await listMemoryFacts(client_!, { includeSuperseded });
+    return { content: [{ type: "text" as const, text: JSON.stringify({ facts, total: facts.length }) }] };
   },
 );
 
@@ -247,6 +265,80 @@ console.assert(
   "expected the about-linked fact",
 );
 console.log(`✓ recall by about found ${aboutFacts.length} fact(s)`);
+
+/* ---- Test 7: hydracode_record_decision with supersedesKey ---------- */
+console.log("\n=== Test 7: hydracode_record_decision with supersedesKey ===");
+// First create a fact to supersede
+const createResult = await mcpClient.callTool({
+  name: "hydracode_record_decision",
+  arguments: {
+    text: "Test decision: prefer approach A",
+    about: "loadConfig",
+  },
+});
+const createContent = (createResult.content as Array<{ type: string; text: string }>)[0]?.text;
+const createJson = JSON.parse(createContent ?? "{}");
+const factKeyToSupersede = createJson.recorded.key;
+console.log(`Created fact to supersede: ${factKeyToSupersede}`);
+
+// Now supersede it
+const supersedingResult = await mcpClient.callTool({
+  name: "hydracode_record_decision",
+  arguments: {
+    text: "Test decision: prefer approach B (supersedes approach A)",
+    about: "loadConfig",
+    supersedesKey: factKeyToSupersede,
+  },
+});
+const supersedingContent = (supersedingResult.content as Array<{ type: string; text: string }>)[0]?.text;
+const supersedingJson = JSON.parse(supersedingContent ?? "{}");
+console.log("Parsed:", JSON.stringify(supersedingJson, null, 2));
+console.assert(typeof supersedingJson.recorded?.key === "string", "recorded.key must be a string");
+console.assert(supersedingJson.recorded.key.startsWith("memory:"), "recorded key must be memory:<uuid>");
+console.assert(typeof supersedingJson.superseded?.key === "string", "superseded.key must be a string");
+console.assert(supersedingJson.superseded.key === factKeyToSupersede, "superseded key must match old fact");
+console.log(
+  `✓ superseding works: recorded=${supersedingJson.recorded.key}, superseded=${supersedingJson.superseded.key}`,
+);
+
+/* ---- Test 8: hydracode_list_memory --------------------------------- */
+console.log("\n=== Test 8: hydracode_list_memory ===");
+const listResult = await mcpClient.callTool({
+  name: "hydracode_list_memory",
+  arguments: {},
+});
+const listContent = (listResult.content as Array<{ type: string; text: string }>)[0]?.text;
+const listJson = JSON.parse(listContent ?? "{}");
+console.log("Parsed (first 2 facts):", JSON.stringify(listJson.facts.slice(0, 2), null, 2));
+console.assert(Array.isArray(listJson.facts), "facts must be an array");
+console.assert(typeof listJson.total === "number", "total must be a number");
+console.assert(listJson.facts.length > 0, "should have at least one active fact");
+for (const fact of listJson.facts) {
+  console.assert(typeof fact.key === "string", "each fact must have a key");
+  console.assert(typeof fact.text === "string", "each fact must have text");
+  console.assert(typeof fact.status === "string", "each fact must have a status");
+  console.assert(Array.isArray(fact.about), "each fact must have an about array");
+}
+console.log(`✓ hydracode_list_memory found ${listJson.total} active fact(s)`);
+
+/* ---- Test 9: hydracode_list_memory with includeSuperseded ----------- */
+console.log("\n=== Test 9: hydracode_list_memory with includeSuperseded ===");
+const listAllResult = await mcpClient.callTool({
+  name: "hydracode_list_memory",
+  arguments: { includeSuperseded: true },
+});
+const listAllContent = (listAllResult.content as Array<{ type: string; text: string }>)[0]?.text;
+const listAllJson = JSON.parse(listAllContent ?? "{}");
+console.log(`Total facts (active + superseded): ${listAllJson.total}`);
+const supersededFacts = listAllJson.facts.filter((f: any) => f.status === "superseded");
+console.log(`Superseded facts: ${supersededFacts.length}`);
+console.assert(supersededFacts.length > 0, "should have at least one superseded fact");
+for (const fact of supersededFacts) {
+  if (fact.supersededBy) {
+    console.log(`  ${fact.key.substring(0, 20)}... superseded by ${fact.supersededBy.substring(0, 20)}...`);
+  }
+}
+console.log(`✓ hydracode_list_memory --all found ${supersededFacts.length} superseded fact(s)`);
 
 /* ---- Tear down ---------------------------------------------------- */
 await mcpClient.close();
