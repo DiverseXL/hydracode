@@ -17,6 +17,7 @@ import { buildGraphSummary, renderAgentsMdSection, MARKER_START, MARKER_END } fr
 import { checkDuplicateRisk, functionNameFromKey } from "./graph/duplicateCheck.js";
 import { recordKnownDuplicate, recordMemoryFactAbout, recallMemoryFacts, listMemoryFacts } from "./memory/store.js";
 import { writeExtractedFiles } from "./graph/writer.js";
+import { buildVisualizationData, renderVisualizationHtml } from "./graph/visualize.js";
 import { HydraClient } from "./hydra/client.js";
 import { HydraConnectionError, HydraQueryError } from "./hydra/errors.js";
 
@@ -28,6 +29,33 @@ program
     "Index a codebase into a HydraDB graph for AI coding agents: multi-hop, relationship-aware context plus a temporal memory layer.",
   )
   .version("0.1.0");
+
+program.addHelpText("after", `
+${pc.dim("─────────────────────────────────────────────────")}
+${pc.bold("Command reference")}
+
+${pc.bold("Indexing")}
+  ${pc.cyan("index [--path] [--watch] [--changed-only]")}    Index a codebase into HydraDB
+  ${pc.cyan("status")}                                      Show graph counts
+  ${pc.cyan("init-hooks")}                                  Install git post-commit hook
+  ${pc.cyan("visualize [--output]")}                        Export graph as interactive HTML
+
+${pc.bold("Querying")}
+  ${pc.cyan("ask \"<question>\" [--max-hops]")}              Multi-hop ask with path evidence
+  ${pc.cyan("check-duplicate \"<name>\" [--file] [--record]")} Pre-write duplicate detection
+
+${pc.bold("Memory")}
+  ${pc.cyan("memory record \"<text>\" [--about] [--supersedes]")}  Record a decision
+  ${pc.cyan("memory recall [query] [--near] [--about]")}          Recall decisions
+  ${pc.cyan("memory list [--all]")}                               Browse all facts
+
+${pc.bold("Agents")}
+  ${pc.cyan("mcp")}                                            Start MCP server on stdio
+  ${pc.cyan("install")}                                        Auto-wire Cursor + Claude Code
+  ${pc.cyan("sync-agents-md")}                                 Update AGENTS.md from graph
+${pc.dim("─────────────────────────────────────────────────")}
+Run ${pc.cyan("hydracode <command> --help")} for detailed options.
+`);
 
 const DEFAULT_INDEX_PATTERNS = "**/*.{ts,tsx,js,jsx}";
 
@@ -338,9 +366,10 @@ memoryCmd
   .description(
     "Recall recorded decisions matching a query, or all facts linked to a node via --about",
   )
-  .argument("<query>", "search text (ignored when --about is given)")
+  .argument("[query]", "search text (ignored when --about or --near is given)")
   .option("--about <name>", "only recall facts linked to this function/class/file")
-  .action(async (query: string, opts: { about?: string }) => {
+  .option("--near <name>", "recall facts about this node AND its file + 1-hop call neighborhood")
+  .action(async (query: string, opts: { about?: string; near?: string }) => {
     try {
       const config = loadConfig();
       const client = new HydraClient(config);
@@ -348,16 +377,26 @@ memoryCmd
       console.log(pc.bold("hydracode memory recall"));
       console.log();
 
-      const facts = await recallMemoryFacts(client, { query, about: opts.about });
+      const facts = await recallMemoryFacts(client, { query, about: opts.about, nearNode: opts.near });
       if (facts.length === 0) {
         console.log(pc.dim("no matching facts found"));
       } else {
+        if (opts.near) {
+          // Render the proximity mode header
+          const anchorAbout = facts.length > 0 ? facts[0].about : [];
+          const display = anchorAbout.length > 0 ? anchorAbout[0] : opts.near;
+          console.log(pc.dim(`memory facts near ${pc.cyan(display)} (file + 1-hop calls)`));
+          console.log();
+        }
         for (const f of facts) {
-          console.log(`  ${pc.green(f.key)} ${pc.dim(`(${f.createdAt})`)}`);
-          console.log(`    ${f.text}`);
+          const hopAnnotation = f.aboutAnchor === false ? pc.dim(" ← neighborhood") : "";
+          const shortKey = f.key.replace("memory:", "").substring(0, 8);
+          const dateStr = f.createdAt.split("T")[0];
+          console.log(`  ${pc.green(`• memory:${shortKey}`)}  ${pc.dim(`"${f.text.substring(0, 60)}${f.text.length > 60 ? "…" : ""}"`)}${hopAnnotation}`);
           if (f.about.length > 0) {
             console.log(pc.dim(`    about: ${f.about.join(", ")}`));
           }
+          console.log(pc.dim(`    recorded ${dateStr} · trust ${f.trust.toFixed(1)}`));
         }
       }
     } catch (err) {
@@ -645,6 +684,45 @@ program
       console.log(`  Functions indexed: ${summary.counts.functions}`);
       console.log(`  High fan-in functions listed: ${summary.highFanIn.length}`);
       console.log(`  Most-connected files listed: ${summary.mostConnected.length}`);
+    } catch (err) {
+      if (err instanceof HydraConnectionError) {
+        console.error(pc.red(`\nerror: ${err.message}`));
+      } else if (err instanceof HydraQueryError) {
+        console.error(
+          pc.red(`\nerror: HydraDB rejected a query (HTTP ${err.status}): ${err.body}`),
+        );
+      } else {
+        console.error(pc.red(`\nerror: ${err instanceof Error ? err.message : String(err)}`));
+      }
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command("visualize")
+  .description("Export the indexed code graph as an interactive HTML visualization")
+  .option("--output <path>", "output file path (default: hydracode-graph.html)", "hydracode-graph.html")
+  .action(async (opts: { output: string }) => {
+    try {
+      const config = loadConfig();
+      const client = new HydraClient(config);
+
+      console.log(pc.bold("hydracode visualize"));
+      console.log();
+
+      const data = await buildVisualizationData(client);
+      if (data.nodes.length === 0) {
+        console.log(pc.yellow("Graph is empty — run `hydracode index` first to populate it."));
+        return;
+      }
+
+      const html = renderVisualizationHtml(data);
+      const outPath = path.resolve(opts.output);
+      fs.writeFileSync(outPath, html, "utf8");
+
+      console.log(pc.green(`\u2713 graph exported to ${opts.output}`));
+      console.log(pc.dim(`  ${data.meta.totalFunctions} functions \u00b7 ${data.meta.totalFiles} files \u00b7 ${data.meta.totalClasses} classes \u00b7 ${data.edges.length} edges`));
+      console.log(pc.dim("  Open in any browser \u2014 no server needed."));
     } catch (err) {
       if (err instanceof HydraConnectionError) {
         console.error(pc.red(`\nerror: ${err.message}`));

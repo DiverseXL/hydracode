@@ -341,10 +341,12 @@ server.tool(
 
 server.tool(
   "hydracode_recall_memory",
-  "Recall past decisions or conventions recorded for this project. Use this before " +
-    "making an architectural choice, to check whether the team already decided something " +
-    "relevant. Pass `about` to get facts linked to a specific function/class/file, or " +
-    "`query` for a text match against recorded facts.",
+  "Recall past decisions or conventions recorded for this project. Pass " +
+    "'nearNode' with a function or file name to retrieve facts about that " +
+    "node AND anything in its call neighborhood or file — use this when " +
+    "working on a specific function to surface all relevant prior decisions " +
+    "without knowing their exact text. Pass 'query' for text-based search, " +
+    "or combine both to narrow proximity results by topic.",
   {
     query: z
       .string()
@@ -357,11 +359,19 @@ server.tool(
       .describe(
         "Optional: only return facts linked via ABOUT to this function/class/file name.",
       ),
+    nearNode: z
+      .string()
+      .optional()
+      .describe(
+        "Optional: function or file name — returns facts about that node AND " +
+          "anything in its call neighborhood or file. Combines with `query` as " +
+          "a post-filter (intersection, not union).",
+      ),
   },
-  async ({ query, about }) => {
+  async ({ query, about, nearNode }) => {
     if (configError || !client) return configErrorContent();
     return safeCall(async () => {
-      const facts = await recallMemoryFacts(client!, { query, about });
+      const facts = await recallMemoryFacts(client!, { query, about, nearNode });
       return {
         content: [{ type: "text", text: JSON.stringify({ facts }) }],
       };

@@ -121,10 +121,11 @@ server.tool(
   {
     query: z.string(),
     about: z.string().optional(),
+    nearNode: z.string().optional(),
   },
-  async ({ query, about }) => {
+  async ({ query, about, nearNode }) => {
     if (!client_) return configErrorContent();
-    const facts = await recallMemoryFacts(client_!, { query, about });
+    const facts = await recallMemoryFacts(client_!, { query, about, nearNode });
     return { content: [{ type: "text" as const, text: JSON.stringify({ facts }) }] };
   },
 );
@@ -265,6 +266,47 @@ console.assert(
   "expected the about-linked fact",
 );
 console.log(`✓ recall by about found ${aboutFacts.length} fact(s)`);
+
+/* ---- Test 6b: hydracode_recall_memory with nearNode ---------------- */
+console.log("\n=== Test 6b: hydracode_recall_memory nearNode=writeExtractedFiles ===");
+const nearResult = await mcpClient.callTool({
+  name: "hydracode_recall_memory",
+  arguments: { query: "", nearNode: "writeExtractedFiles" },
+});
+const nearContent = (nearResult.content as Array<{ type: string; text: string }>)[0]?.text;
+const nearJson = JSON.parse(nearContent ?? "{}");
+console.log("Parsed:", JSON.stringify(nearJson, null, 2));
+const nearFacts = (nearJson.facts as Array<{ key: string; text: string; about: string[]; trust: number; aboutAnchor?: boolean }>) ?? [];
+console.assert(Array.isArray(nearFacts), "facts must be an array");
+for (const f of nearFacts) {
+  console.assert(typeof f.key === "string" && f.key.startsWith("memory:"), "fact key must be memory:<uuid>");
+  console.assert(typeof f.text === "string", "fact text must be a string");
+  console.assert(typeof f.trust === "number", "fact trust must be a number");
+  console.assert(Array.isArray(f.about), "fact about must be an array");
+}
+console.log(`✓ nearNode recall found ${nearFacts.length} fact(s) via proximity`);
+if (nearFacts.length > 0) {
+  const aboutAnchor = nearFacts.filter(f => f.aboutAnchor === true);
+  const aboutNeighborhood = nearFacts.filter(f => f.aboutAnchor === false);
+  console.log(`  ${aboutAnchor.length} about anchor, ${aboutNeighborhood.length} about neighborhood`);
+}
+
+/* ---- Test 6c: nearNode + query post-filter ------------------------- */
+console.log("\n=== Test 6c: hydracode_recall_memory nearNode+query post-filter ===");
+const nearQueryResult = await mcpClient.callTool({
+  name: "hydracode_recall_memory",
+  arguments: { query: "GHCR", nearNode: "writeExtractedFiles" },
+});
+const nearQueryContent = (nearQueryResult.content as Array<{ type: string; text: string }>)[0]?.text;
+const nearQueryJson = JSON.parse(nearQueryContent ?? "{}");
+const nearQueryFacts = (nearQueryJson.facts as Array<{ key: string; text: string; about: string[] }>) ?? [];
+console.log(`nearNode+query returned ${nearQueryFacts.length} fact(s) (should be subset of proximity-only)`);
+if (nearQueryFacts.length > 0) {
+  for (const f of nearQueryFacts) {
+    console.assert(f.text.toLowerCase().includes("ghcr"), `fact should match 'GHCR': ${f.text.substring(0, 80)}`);
+  }
+}
+console.log("✓ nearNode+query post-filter works");
 
 /* ---- Test 7: hydracode_record_decision with supersedesKey ---------- */
 console.log("\n=== Test 7: hydracode_record_decision with supersedesKey ===");

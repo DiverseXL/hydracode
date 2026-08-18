@@ -234,6 +234,10 @@ export interface MemoryFactRecord {
   createdAt: string;
   /** Display names of nodes this fact is ABOUT (qualified names / paths). */
   about: string[];
+  /** Confidence 0–1; defaults to 1.0. */
+  trust: number;
+  /** When nearNode is used: whether this fact is directly about the anchor (true) or about a neighborhood node (false). */
+  aboutAnchor?: boolean;
 }
 
 /** Cap on recalled facts (spec: keep it small and bounded). */
@@ -271,19 +275,170 @@ function rowCells(row: unknown): unknown[] {
  * with an ABOUT edge to the matched node (the same query shape
  * duplicateCheck.ts uses to surface recorded decisions).
  *
- * When no `about`: token-overlap match against MemoryFact.text — the
+ * When `nearNode` is given: resolve the anchor via findByName, then find
+ * its file + 1-hop call neighborhood via two graph queries (the engine's
+ * variable-length MATCH only supports one relationship type per pattern, so
+ * CALLS*0..1 and the CONTAINS file lookup are issued separately and merged
+ * in memory). Returns all active MemoryFact nodes ABOUT any neighbor.
+ *
+ * When no `about` or `nearNode`: token-overlap match against MemoryFact.text — the
  * duplicate-check's name-similarity logic applied to fact text (same
  * nameTokens tokenizer, plus a stopword filter). Sorted by overlap,
  * capped at MAX_RECALL.
+ *
+ * When both `nearNode` AND `query` are provided: proximity is the primary
+ * signal, text narrows it further (intersect, not union).
  */
 export async function recallMemoryFacts(
   client: HydraClient,
-  opts: { query?: string; about?: string },
+  opts: { query?: string; about?: string; nearNode?: string },
 ): Promise<MemoryFactRecord[]> {
-  let factRows: { key: string; text: string; createdAt: string }[] = [];
+  let factRows: { key: string; text: string; createdAt: string; trust: number; aboutAnchor?: boolean }[] = [];
 
+  const nearName = opts.nearNode?.trim() ?? "";
   const aboutName = opts.about?.trim() ?? "";
-  if (aboutName.length > 0) {
+
+  if (nearName.length > 0) {
+    // --- Proximity-based retrieval (nearNode) ---
+    const matches = await findByName(client, nearName);
+    if (matches.length === 0) {
+      throw new Error(
+        `No indexed node found named "${nearName}" — run \`hydracode index\` first.`,
+      );
+    }
+    if (matches.length > 1) {
+      throw new Error(
+        `"${nearName}" matched ${matches.length} nodes (${matches
+          .map((m) => m.key)
+          .join(", ")}). Be more specific — use the exact function qualified name or file path.`,
+      );
+    }
+    const anchor = matches[0];
+
+    // Step 2: get the anchor's file and call neighborhood.
+    // Grammar constraint: variable-length MATCH requires exactly one
+    // relationship type per pattern (confirmed: multi-type CALLS|CONTAINS
+    // is rejected). Two-query fallback:
+    //   Query A: CALLS*0..1 from the anchor (direct callees + anchor itself)
+    //   Query B: CONTAINS lookup — which File CONTAINS the anchor
+    // The results are merged into one flat set of neighbor ids.
+    const neighborIds = new Set<number>();
+    const neighborMeta = new Map<number, { key: string; rel: string }>();
+
+    // Include the anchor itself in the neighbor set.
+    // NOTE: HydraDB's variable-length MATCH requires *1..N (minimum 1 hop),
+    // so CALLS*0..1 is NOT supported — we add the anchor explicitly.
+    neighborIds.add(anchor.id);
+
+    // Query A: direct CALLS neighbors (1 hop out from anchor)
+    const callsRes = await client.query(
+      `MATCH ({id: $anchorId})-[:CALLS*1..1]->(neighbor) RETURN DISTINCT neighbor.id, neighbor.key`,
+      { anchorId: anchor.id },
+      { consistency: "strong" },
+    );
+    for (const row of callsRes.rows) {
+      const cells = rowCells(row);
+      const nid = Number(unwrapValue(cells[0]));
+      const nkey = cellStr(cells[1]);
+      if (!Number.isNaN(nid) && nkey !== "") {
+        neighborIds.add(nid);
+        if (nid !== anchor.id) {
+          neighborMeta.set(nid, { key: nkey, rel: "CALLS" });
+        }
+      }
+    }
+
+    // Query B: which File CONTAINS this anchor
+    const fileRes = await client.query(
+      `MATCH (file:${NODE_LABELS.FILE})-[:CONTAINS]->(anchor {id: $anchorId}) RETURN DISTINCT file.id, file.key`,
+      { anchorId: anchor.id },
+      { consistency: "strong" },
+    );
+    for (const row of fileRes.rows) {
+      const cells = rowCells(row);
+      const fid = Number(unwrapValue(cells[0]));
+      const fkey = cellStr(cells[1]);
+      if (!Number.isNaN(fid) && fkey !== "") {
+        neighborIds.add(fid);
+        neighborMeta.set(fid, { key: fkey, rel: "CONTAINS" });
+      }
+    }
+
+    // Step 3: fetch active MemoryFact nodes ABOUT any of those neighbor ids.
+    // Grammar constraint: UNWIND MATCH does not support WHERE in HydraDB
+    // ("UNWIND MATCH does not support OPTIONAL, hints, or WHERE"), so we
+    // cannot use `UNWIND $ids AS nid MATCH (m)-[:ABOUT]->({id: nid})`.
+    // Instead, fetch all active facts with their ABOUT edges and filter in
+    // JS — the memory graph is small (bounded by MAX_RECALL) so this is
+    // efficient.
+    const factsRes = await client.query(
+      `MATCH (m:${NODE_LABELS.MEMORY_FACT})-[:${REL_TYPES.ABOUT}]->(t)
+WHERE m.status = 'active'
+RETURN m.key AS mk, m.text AS text, m.createdAt AS createdAt, m.trust AS trust, t.id AS tid, t.key AS tkey`,
+      undefined,
+      { consistency: "strong" },
+    );
+
+    // Deduplicate by fact key, merging aboutKey values into about[]
+    const factByKey = new Map<string, { key: string; text: string; createdAt: string; trust: number; aboutKeys: string[]; aboutNids: Set<number> }>();
+    for (const row of factsRes.rows) {
+      const cells = rowCells(row);
+      const k = cellStr(cells[0]);
+      const tid = Number(unwrapValue(cells[4]));
+      if (k === "") continue;
+      // Only include facts whose ABOUT target is in the neighbor set
+      if (!neighborIds.has(tid)) continue;
+      const existing = factByKey.get(k);
+      if (existing) {
+        const ak = cellStr(cells[5]);
+        if (!existing.aboutKeys.includes(ak)) existing.aboutKeys.push(ak);
+        existing.aboutNids.add(tid);
+      } else {
+        factByKey.set(k, {
+          key: k,
+          text: cellStr(cells[1]),
+          createdAt: cellStr(cells[2]),
+          trust: Number(unwrapValue(cells[3])) || 1.0,
+          aboutKeys: [cellStr(cells[5])],
+          aboutNids: new Set([tid]),
+        });
+      }
+    }
+
+    // Step 4: if query is ALSO provided, post-filter proximity results
+    let filteredFacts = [...factByKey.values()];
+    const q = opts.query?.trim() ?? "";
+    if (q.length > 0) {
+      const qTokens = nameTokens(q).filter((t) => !TEXT_STOPWORDS.has(t));
+      if (qTokens.length > 0) {
+        filteredFacts = filteredFacts
+          .map((f) => {
+            const fTokens = new Set(
+              nameTokens(f.text).filter((t) => !TEXT_STOPWORDS.has(t)),
+            );
+            let overlap = 0;
+            for (const t of qTokens) if (fTokens.has(t)) overlap++;
+            return { fact: f, overlap };
+          })
+          .filter((s) => s.overlap >= 1)
+          .sort((a, b) => b.overlap - a.overlap)
+          .map((s) => s.fact);
+      }
+    }
+
+    // Sort by trust DESC then createdAt DESC, cap at MAX_RECALL
+    filteredFacts
+      .sort((a, b) => b.trust - a.trust || b.createdAt.localeCompare(a.createdAt));
+    const limited = filteredFacts.slice(0, MAX_RECALL);
+
+    factRows = limited.map((f) => ({
+      key: f.key,
+      text: f.text,
+      createdAt: f.createdAt,
+      trust: f.trust,
+      aboutAnchor: f.aboutNids.has(anchor.id),
+    }));
+  } else if (aboutName.length > 0) {
     const matches = await findByName(client, aboutName);
     if (matches.length === 0) {
       throw new Error(
@@ -293,7 +448,7 @@ export async function recallMemoryFacts(
     const seen = new Set<string>();
     for (const m of matches) {
       const res = await client.query(
-        `MATCH (m:${NODE_LABELS.MEMORY_FACT})-[:${REL_TYPES.ABOUT}]->(t:${m.label}) WHERE t.key = $key AND m.status = 'active' RETURN m.key AS k, m.text AS text, m.createdAt AS createdAt`,
+        `MATCH (m:${NODE_LABELS.MEMORY_FACT})-[:${REL_TYPES.ABOUT}]->(t:${m.label}) WHERE t.key = $key AND m.status = 'active' RETURN m.key AS k, m.text AS text, m.createdAt AS createdAt, m.trust AS trust`,
         { key: m.key },
         { consistency: "strong" },
       );
@@ -302,13 +457,13 @@ export async function recallMemoryFacts(
         const k = cellStr(cells[0]);
         if (k !== "" && !seen.has(k)) {
           seen.add(k);
-          factRows.push({ key: k, text: cellStr(cells[1]), createdAt: cellStr(cells[2]) });
+          factRows.push({ key: k, text: cellStr(cells[1]), createdAt: cellStr(cells[2]), trust: Number(unwrapValue(cells[3])) || 1.0 });
         }
       }
     }
   } else {
     const res = await client.query(
-      `MATCH (m:${NODE_LABELS.MEMORY_FACT}) WHERE m.status = 'active' RETURN m.key AS k, m.text AS text, m.createdAt AS createdAt`,
+      `MATCH (m:${NODE_LABELS.MEMORY_FACT}) WHERE m.status = 'active' RETURN m.key AS k, m.text AS text, m.createdAt AS createdAt, m.trust AS trust`,
       undefined,
       { consistency: "strong" },
     );
@@ -316,7 +471,7 @@ export async function recallMemoryFacts(
       const cells = rowCells(row);
       const k = cellStr(cells[0]);
       if (k !== "") {
-        factRows.push({ key: k, text: cellStr(cells[1]), createdAt: cellStr(cells[2]) });
+        factRows.push({ key: k, text: cellStr(cells[1]), createdAt: cellStr(cells[2]), trust: Number(unwrapValue(cells[3])) || 1.0 });
       }
     }
 
@@ -365,7 +520,14 @@ export async function recallMemoryFacts(
     aboutByFact.set(mk, list);
   }
 
-  return factRows.map((f) => ({ ...f, about: aboutByFact.get(f.key) ?? [] }));
+  return factRows.map((f) => ({
+    key: f.key,
+    text: f.text,
+    createdAt: f.createdAt,
+    about: aboutByFact.get(f.key) ?? [],
+    trust: f.trust,
+    aboutAnchor: f.aboutAnchor,
+  }));
 }
 
 /** One listed memory fact with full details. */
