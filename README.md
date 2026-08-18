@@ -173,16 +173,29 @@ Auto-detects and writes MCP config for Cursor (`.cursor/mcp.json`) and Claude Co
 
 ---
 
+## Visualizing the graph
+
+```bash
+node dist/cli.js visualize
+# exports hydracode-graph.html — open in any browser
+```
+
+Exports the full indexed code graph as an interactive, self-contained HTML file powered by D3.js. Nodes are color-coded by type (blue = File, orange = Function, green = Class) and sized by connection count — **high fan-in nodes (functions called by many others) are visibly larger**, which is a good visual signal for "change this carefully." Click any node to highlight its direct neighbors and dim everything else; scroll to zoom, drag to pan. No server needed — just open the file in any browser.
+
+---
+
 ## Command reference
 
 | Command | Description |
 |---|---|
 | `hydracode index [--path <dir>] [--watch] [--changed-only]` | Index (or re-index) a codebase. `--watch` runs a live file watcher with debounced incremental reindexing. `--changed-only` indexes just the files touched in the last git commit. |
+| `hydracode visualize [--output <path>]` | Export the indexed code graph as an interactive, self-contained HTML page with a D3.js force-directed visualization. Default output: `hydracode-graph.html`. |
 | `hydracode ask "<question>" [--max-hops <n>]` | Ask a structural question; returns results plus path evidence where available. |
 | `hydracode status` | Show whether the current graph is indexed, and basic counts (files/functions/classes/tests). |
 | `hydracode check-duplicate "<name>" [--file <path>] [--record "<reason>"]` | Check whether a proposed function name/purpose likely already exists. `--record` persists a deliberate-duplicate decision so future checks don't re-flag it. |
-| `hydracode memory record "<text>" [--about <name>]` | Record a project decision or convention, optionally linked to a specific function/class/file. |
-| `hydracode memory recall "<query>" [--about <name>]` | Recall previously recorded decisions. |
+| `hydracode memory record "<text>" [--about <name>] [--supersedes <key>]` | Record a project decision or convention, optionally linked to a specific function/class/file. `--supersedes` marks an older fact as replaced (SUPERSEDED_BY edge) so stale decisions never win over current ones. |
+| `hydracode memory recall [query] [--about <name>] [--near <name>]` | Recall previously recorded decisions. `--near` returns facts about a node AND its file + call neighborhood — no text match needed. Combine with a query to narrow by topic. |
+| `hydracode memory list [--all]` | Browse all active memory facts. `--all` includes superseded facts to see the full decision history. |
 | `hydracode sync-agents-md` | Generate or update the auto-generated section of `AGENTS.md` from the live graph. Preserves any hand-written content outside the markers. |
 | `hydracode init-hooks` | Install a git `post-commit` hook that automatically reindexes changed files after every commit. |
 | `hydracode mcp` | Start the MCP server on stdio — this is what an MCP client launches as a subprocess. |
@@ -196,10 +209,55 @@ Auto-detects and writes MCP config for Cursor (`.cursor/mcp.json`) and Claude Co
 | `hydracode_index` | `index` | Always runs quiet (no stdout pollution — required for a clean MCP stdio stream) |
 | `hydracode_ask` | `ask` | Returns structured JSON, not colored terminal text |
 | `hydracode_check_duplicate` | `check-duplicate` | Description is written to invite agents to call it *before* writing new code |
-| `hydracode_record_decision` | `memory record` | |
-| `hydracode_recall_memory` | `memory recall` | |
+| `hydracode_record_decision` | `memory record` | Accepts `about` and `supersedesKey` — mark old decisions as replaced so they're filtered from recall |
+| `hydracode_recall_memory` | `memory recall` | Accepts `nearNode` for proximity retrieval — facts about a node's call/file neighborhood, not just text matches |
+| `hydracode_list_memory` | `memory list` | Browse all active facts; `includeSuperseded` option shows full decision history |
 
 CLI and MCP paths share the exact same underlying pipeline functions — there is no forked logic between "what a human sees" and "what an agent sees."
+
+---
+
+## Memory layer
+
+hydracode includes a temporal memory layer that lets agents record and recall project decisions, conventions, and rationales — so the same question isn't re-debated every session.
+
+### Recording decisions
+
+```bash
+node dist/cli.js memory record "Use tsc --incremental for faster rebuilds" --about writeExtractedFiles
+```
+
+Records a `MemoryFact` node in the graph, optionally linked via an `ABOUT` edge to a specific function, class, or file. Use `--supersedes <key>` to mark an older fact as replaced — the old fact's status changes to `superseded` and it is automatically filtered out of normal recall, so stale decisions never win over current ones.
+
+### Recalling decisions
+
+```bash
+# Text search across all facts
+node dist/cli.js memory recall "incremental build"
+
+# Facts linked to a specific node
+node dist/cli.js memory recall --about writeExtractedFiles
+
+# Proximity recall — facts about a node AND its call/file neighborhood
+node dist/cli.js memory recall --near writeExtractedFiles
+```
+
+The `--near` flag is the key differentiator from a vector store. A vector store finds facts that *mention* a function by name. Proximity recall finds facts about *anything that function calls* or *anything in the same file* — one graph traversal, no text match required. When combined with a query, proximity is the primary signal and the text narrows the results (intersection, not union).
+
+### Browsing all facts
+
+```bash
+node dist/cli.js memory list        # active facts only
+node dist/cli.js memory list --all  # include superseded facts
+```
+
+### MCP tools
+
+The same memory operations are available as MCP tools for coding agents:
+
+- `hydracode_record_decision` — record a fact with optional `about` and `supersedesKey`
+- `hydracode_recall_memory` — recall with `query`, `about`, or `nearNode` (proximity)
+- `hydracode_list_memory` — browse all facts, with `includeSuperseded` option
 
 ---
 
@@ -217,6 +275,8 @@ HydraDB isn't incidental — it's the storage and query engine for the entire pr
 
 All of the above were verified against HydraDB's live source and a running instance — not assumed from documentation, since several of them (integer-only ids, relationship-type-required-in-MERGE, no grouped-aggregation-by-default-assumption) are not what a Neo4j-familiar developer would expect by default.
 
+- **The memory layer stores `MemoryFact` nodes with `ABOUT` edges** linking decisions to the specific `Function`, `ClassEntity`, or `File` nodes they concern. `SUPERSEDED_BY` edges connect old decisions to the facts that replace them, making fact currency unambiguous — the node's `status` field is the authoritative signal, not edge traversal. **Proximity recall** traverses `CALLS` and `CONTAINS` edges from an anchor node to find all neighboring node ids, then fetches `MemoryFact` nodes with `ABOUT` edges pointing at any of those ids — a query that is structurally impossible for a flat memory store.
+
 ---
 
 ## Known limitations
@@ -228,6 +288,9 @@ Being upfront about these rather than hiding them:
 - **Test coverage linking isn't implemented yet.** Test nodes are extracted, but nothing currently links a test to the code it covers, so `sync-agents-md`'s test-coverage section is honest about this rather than reporting a misleading "0 untested functions."
 - **File deletion isn't reconciled.** If a file is removed from disk, its previously-indexed nodes remain in the graph until a full re-index or manual cleanup — the GC pass only cleans up stale versions *within* files that were actually re-indexed in a given run.
 - **Full memory/contradiction tracking (Track 03's `SUPERSEDED_BY`/`CONTRADICTS`) is out of scope for this submission.** The memory layer that exists (`MemoryFact` + `ABOUT` edges) is deliberately scoped to what the duplicate-check feature needed — a fuller temporal/trust-propagation memory graph is a natural extension, not something built here.
+- **Multi-type variable-length patterns are rejected.** Writing `MATCH (a)-[:CALLS|CONTAINS*1..3]->(b)` fails — HydraDB requires exactly one relationship type per variable-length pattern. The workaround is two separate queries with different types, merged in JS.
+- **Variable-length `*0..N` minimum-hop is not supported.** The minimum is `*1..N` — a 0-hop self-inclusion (e.g. `CALLS*0..1` to also return the anchor node) is rejected. When the anchor itself needs to be in the result set, it must be added explicitly.
+- **`UNWIND MATCH` does not support `WHERE`.** The error is `"UNWIND MATCH does not support OPTIONAL, hints, or WHERE"` — so `UNWIND $ids AS nid MATCH (m)-[:ABOUT]->({id: nid}) WHERE m.status = 'active'` fails. The workaround is to fetch all active facts and filter in JS, which is efficient given the memory graph's small size.
 - **The git post-commit hook runs synchronously on Windows/Git Bash** (a background-subshell quirk observed during development), typically completing in well under a second for incremental reindexes — negligible in practice, but worth knowing if you're extending it.
 
 ---
@@ -264,6 +327,7 @@ src/
     duplicateCheck.ts                Duplicate-detection logic
     agentsSummary.ts                  Graph-derived AGENTS.md content
     hashId.ts                          String key -> integer vertex id
+    visualize.ts                       Graph visualization data + HTML export
   memory/
     store.ts                             MemoryFact read/write
   mcp/
