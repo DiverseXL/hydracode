@@ -382,10 +382,8 @@ memoryCmd
         console.log(pc.dim("no matching facts found"));
       } else {
         if (opts.near) {
-          // Render the proximity mode header
-          const anchorAbout = facts.length > 0 ? facts[0].about : [];
-          const display = anchorAbout.length > 0 ? anchorAbout[0] : opts.near;
-          console.log(pc.dim(`memory facts near ${pc.cyan(display)} (file + 1-hop calls)`));
+          // Render the proximity mode header — always show the anchor name
+          console.log(pc.dim(`memory facts near ${pc.cyan(opts.near)} (file + 1-hop calls)`));
           console.log();
         }
         for (const f of facts) {
