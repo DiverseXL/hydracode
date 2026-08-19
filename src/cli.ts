@@ -9,10 +9,10 @@ import pc from "picocolors";
 import fg from "fast-glob";
 import { loadConfig } from "./config.js";
 import { extractRepo, extractFile } from "./extract/tsExtractor.js";
-import { runAskPipeline, describeKey, chainDisplay } from "./graph/askPipeline.js";
+import { runAskPipeline, describeKey, chainDisplay, resolveSymbol } from "./graph/askPipeline.js";
 import type { AskResultNode, AskEvidencePath } from "./graph/askPipeline.js";
 import { runInstall } from "./install.js";
-import { getGraphStatus, MAX_HOPS } from "./graph/query.js";
+import { getGraphStatus, getCallers, getCallees, getPathEvidence, MAX_HOPS } from "./graph/query.js";
 import { buildGraphSummary, renderAgentsMdSection, MARKER_START, MARKER_END } from "./graph/agentsSummary.js";
 import { checkDuplicateRisk, functionNameFromKey } from "./graph/duplicateCheck.js";
 import { recordKnownDuplicate, recordMemoryFactAbout, recallMemoryFacts, listMemoryFacts } from "./memory/store.js";
@@ -41,6 +41,9 @@ ${pc.bold("Indexing")}
   ${pc.cyan("visualize [--output]")}                        Export graph as interactive HTML
 
 ${pc.bold("Querying")}
+  ${pc.cyan("callers <symbol> [--max-hops]")}         Who calls this function (transitive)
+  ${pc.cyan("callees <symbol> [--max-hops]")}         What this function calls (transitive)
+  ${pc.cyan("impact <symbol> [--max-hops]")}          Full blast radius: callers + callees + paths
   ${pc.cyan("ask \"<question>\" [--max-hops]")}              Multi-hop ask with path evidence
   ${pc.cyan("check-duplicate \"<name>\" [--file] [--record]")} Pre-write duplicate detection
 
@@ -812,6 +815,236 @@ program
         console.error(pc.red(`\nerror: ${err instanceof Error ? err.message : String(err)}`));
       }
       process.exitCode = 1;
+    }
+  });
+
+program
+  .command("callers")
+  .description("Find all functions that call a given function (transitive)")
+  .argument("<symbol>", "function name to look up")
+  .option("--max-hops <n>", "max traversal depth (clamped to 3)", "3")
+  .option("--json", "output raw JSON instead of formatted text")
+  .action(async (symbol: string, opts: { maxHops: string; json: boolean }) => {
+    const client = new HydraClient(loadConfig());
+    const maxHops = Math.min(Math.max(1, Number(opts.maxHops) || MAX_HOPS), MAX_HOPS);
+
+    const resolved = await resolveSymbol(client, symbol);
+    if (!resolved.resolved) {
+      console.log(pc.red(resolved.message));
+      if (resolved.ambiguous && resolved.candidates) {
+        for (let i = 0; i < resolved.candidates.length; i++) {
+          console.log(`  ${i + 1}. ${resolved.candidates[i].label}`);
+        }
+      }
+      process.exitCode = 1;
+      return;
+    }
+
+    const callers = await getCallers(client, resolved.node.id, maxHops);
+    const results: AskResultNode[] = callers.map((c) => ({
+      key: c.key,
+      display: describeKey(c.key),
+      file: c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#")[0] ?? c.key,
+      line: (() => {
+        const parts = c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#");
+        const last = parts[parts.length - 1];
+        return parts.length >= 3 && last !== undefined && /^\d+$/.test(last) ? parseInt(last, 10) : undefined;
+      })(),
+    }));
+
+    if (opts.json) {
+      console.log(JSON.stringify({
+        resolved: true,
+        symbol,
+        callers: results.map((r) => ({ key: r.key, file: r.file, line: r.line })),
+        message: `found ${results.length} caller(s) of ${describeKey(resolved.node.key)}`,
+      }, null, 2));
+      return;
+    }
+
+    console.log(pc.bold(`\ncallers of ${pc.cyan(describeKey(resolved.node.key))}`));
+    if (results.length === 0) {
+      console.log(pc.dim("  (no callers found)"));
+    } else {
+      console.log(`  ${pc.bold("callers")} (${results.length}):`);
+      for (const r of results) {
+        console.log(`    ${pc.green(r.display)}`);
+      }
+    }
+  });
+
+program
+  .command("callees")
+  .description("Find all functions that a given function calls (transitive)")
+  .argument("<symbol>", "function name to look up")
+  .option("--max-hops <n>", "max traversal depth (clamped to 3)", "3")
+  .option("--json", "output raw JSON instead of formatted text")
+  .action(async (symbol: string, opts: { maxHops: string; json: boolean }) => {
+    const client = new HydraClient(loadConfig());
+    const maxHops = Math.min(Math.max(1, Number(opts.maxHops) || MAX_HOPS), MAX_HOPS);
+
+    const resolved = await resolveSymbol(client, symbol);
+    if (!resolved.resolved) {
+      console.log(pc.red(resolved.message));
+      if (resolved.ambiguous && resolved.candidates) {
+        for (let i = 0; i < resolved.candidates.length; i++) {
+          console.log(`  ${i + 1}. ${resolved.candidates[i].label}`);
+        }
+      }
+      process.exitCode = 1;
+      return;
+    }
+
+    const callees = await getCallees(client, resolved.node.id, maxHops);
+    const results: AskResultNode[] = callees.map((c) => ({
+      key: c.key,
+      display: describeKey(c.key),
+      file: c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#")[0] ?? c.key,
+      line: (() => {
+        const parts = c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#");
+        const last = parts[parts.length - 1];
+        return parts.length >= 3 && last !== undefined && /^\d+$/.test(last) ? parseInt(last, 10) : undefined;
+      })(),
+    }));
+
+    if (opts.json) {
+      console.log(JSON.stringify({
+        resolved: true,
+        symbol,
+        callees: results.map((r) => ({ key: r.key, file: r.file, line: r.line })),
+        message: `found ${results.length} callee(s) of ${describeKey(resolved.node.key)}`,
+      }, null, 2));
+      return;
+    }
+
+    console.log(pc.bold(`\ncallees of ${pc.cyan(describeKey(resolved.node.key))}`));
+    if (results.length === 0) {
+      console.log(pc.dim("  (no callees found)"));
+    } else {
+      console.log(`  ${pc.bold("callees")} (${results.length}):`);
+      for (const r of results) {
+        console.log(`    ${pc.green(r.display)}`);
+      }
+    }
+  });
+
+program
+  .command("impact")
+  .description("Full blast radius: callers + callees + call-chain paths")
+  .argument("<symbol>", "function name to assess")
+  .option("--max-hops <n>", "max traversal depth (clamped to 3)", "3")
+  .option("--json", "output raw JSON instead of formatted text")
+  .action(async (symbol: string, opts: { maxHops: string; json: boolean }) => {
+    const client = new HydraClient(loadConfig());
+    const maxHops = Math.min(Math.max(1, Number(opts.maxHops) || MAX_HOPS), MAX_HOPS);
+
+    const resolved = await resolveSymbol(client, symbol);
+    if (!resolved.resolved) {
+      console.log(pc.red(resolved.message));
+      if (resolved.ambiguous && resolved.candidates) {
+        for (let i = 0; i < resolved.candidates.length; i++) {
+          console.log(`  ${i + 1}. ${resolved.candidates[i].label}`);
+        }
+      }
+      process.exitCode = 1;
+      return;
+    }
+
+    const [callers, callees, rawPaths] = await Promise.all([
+      getCallers(client, resolved.node.id, maxHops),
+      getCallees(client, resolved.node.id, maxHops),
+      getPathEvidence(client, resolved.node.id, {
+        relTypes: ["CALLS" as const],
+        maxLen: maxHops,
+        pathCount: 10,
+      }),
+    ]);
+
+    const callerResults = callers.map((c) => ({ key: c.key, file: c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#")[0] ?? c.key, line: (() => { const parts = c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#"); const last = parts[parts.length - 1]; return parts.length >= 3 && last !== undefined && /^\d+$/.test(last) ? parseInt(last, 10) : undefined; })() }));
+    const calleeResults = callees.map((c) => ({ key: c.key, file: c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#")[0] ?? c.key, line: (() => { const parts = c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#"); const last = parts[parts.length - 1]; return parts.length >= 3 && last !== undefined && /^\d+$/.test(last) ? parseInt(last, 10) : undefined; })() }));
+    const evidence = rawPaths
+      .filter((p) => p.parseSucceeded)
+      .slice(0, 10)
+      .map((p) => ({
+        pathText: (() => {
+          const labels = p.nodes.map((n) => {
+            const bare = n.key.replace(/^(file|module|function|class|test|memory):/, "");
+            if (n.key.startsWith("function:") || n.key.startsWith("test:")) {
+              const parts = bare.split("#");
+              if (parts.length >= 3) return parts[parts.length - 2] ?? bare;
+            }
+            return bare;
+          });
+          if (p.rels && p.rels.length === p.nodes.length - 1) {
+            let text = `[${labels[0]}]`;
+            for (let i = 0; i < p.rels.length; i++) {
+              text += ` -[:${p.rels[i]}]-> [${labels[i + 1]}]`;
+            }
+            return text;
+          }
+          return labels.join(" → ");
+        })(),
+        weight: p.weight,
+      }));
+
+    if (opts.json) {
+      console.log(JSON.stringify({
+        resolved: true,
+        symbol,
+        callers: callerResults,
+        callees: calleeResults,
+        evidence,
+        message: `impact of ${describeKey(resolved.node.key)}: ${callerResults.length} callers, ${calleeResults.length} callees, ${evidence.length} paths`,
+      }, null, 2));
+      return;
+    }
+
+    const anchorLabel = describeKey(resolved.node.key);
+    console.log(pc.bold(`\nimpact of ${pc.cyan(anchorLabel)}`));
+    console.log();
+
+    // CALLERS section
+    console.log(pc.bold(`CALLERS (${callerResults.length})`) + pc.dim(" — things that break if you change the signature"));
+    if (callerResults.length === 0) {
+      console.log(pc.dim("  (none)"));
+    } else {
+      for (const r of callerResults) {
+        const display = describeKey(r.key);
+        console.log(`  ${pc.green(display)}`);
+      }
+    }
+    console.log();
+
+    // CALLEES section
+    console.log(pc.bold(`CALLEES (${calleeResults.length})`) + pc.dim(" — things this function breaks if they change"));
+    if (calleeResults.length === 0) {
+      console.log(pc.dim("  (none)"));
+    } else {
+      for (const r of calleeResults) {
+        const display = describeKey(r.key);
+        console.log(`  ${pc.green(display)}`);
+      }
+    }
+    console.log();
+
+    // CALL PATHS section
+    console.log(pc.bold(`CALL PATHS (${evidence.length})`) + pc.dim(" — actual chain evidence"));
+    if (evidence.length === 0) {
+      console.log(pc.dim("  (no paths found)"));
+    } else {
+      for (const p of evidence) {
+        const rendered = p.pathText.includes(" -[")
+          ? p.pathText
+              .replace(/\[([^\]]+)\]/g, (_m: string, name: string) => pc.green(`[${name}]`))
+              .replace(/( -\[:[^\]]+\]-> )/g, (_m: string, sep: string) => pc.dim(sep))
+          : p.pathText
+              .split(" \u2192 ")
+              .map((seg: string) => pc.green(seg))
+              .join(pc.dim(" \u2192 "));
+        console.log(
+          `  ${rendered}${p.weight !== undefined ? pc.dim(`  (weight ${p.weight})`) : ""}`,
+        );
+      }
     }
   });
 

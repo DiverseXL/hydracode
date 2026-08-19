@@ -297,3 +297,53 @@ function nodeRefToResult(ref: GraphNodeRef): AskResultNode {
       : undefined;
   return { key: ref.key, display, file, line };
 }
+
+/* ------------------------------------------------------------------ */
+/* resolveSymbol — single-name resolution for callers/callees/impact   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Resolve a single symbol name against the graph, returning a clean
+ * discriminated union. Used by the CLI callers/callees/impact commands
+ * and the MCP tools of the same name — avoids copy-pasted resolution
+ * logic across multiple handlers.
+ */
+export async function resolveSymbol(
+  client: HydraClient,
+  symbol: string,
+): Promise<
+  | { resolved: true; node: GraphNodeRef }
+  | {
+      resolved: false;
+      ambiguous: boolean;
+      candidates?: { key: string; label: string }[];
+      message: string;
+    }
+> {
+  const matches = await findByName(client, symbol);
+
+  if (matches.length === 0) {
+    return {
+      resolved: false,
+      ambiguous: false,
+      message:
+        `No indexed function named "${symbol}" — run \`hydracode index\` first, or check the spelling.`,
+    };
+  }
+
+  if (matches.length === 1) {
+    return { resolved: true, node: matches[0] };
+  }
+
+  // Ambiguous: multiple nodes share this name.
+  return {
+    resolved: false,
+    ambiguous: true,
+    candidates: matches.map((m) => ({
+      key: m.key,
+      label: describeKey(m.key),
+    })),
+    message:
+      `Multiple nodes named "${symbol}" — re-run with a more specific name (e.g. the exact function or file path).`,
+  };
+}

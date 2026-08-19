@@ -13,7 +13,8 @@ import { z } from "zod";
 import { loadConfig } from "../src/config.js";
 import { HydraClient, unwrapValue } from "../src/hydra/client.js";
 import { NODE_LABELS } from "../src/graph/schema.js";
-import { runAskPipeline } from "../src/graph/askPipeline.js";
+import { runAskPipeline, resolveSymbol } from "../src/graph/askPipeline.js";
+import { getCallers, getCallees, getPathEvidence } from "../src/graph/query.js";
 import { checkDuplicateRisk } from "../src/graph/duplicateCheck.js";
 import {
   recallMemoryFacts,
@@ -139,6 +140,81 @@ server.tool(
     if (!client_) return configErrorContent();
     const facts = await listMemoryFacts(client_!, { includeSuperseded });
     return { content: [{ type: "text" as const, text: JSON.stringify({ facts, total: facts.length }) }] };
+  },
+);
+
+server.tool(
+  "hydracode_callers",
+  { symbol: z.string(), maxHops: z.number().int().min(1).max(3).default(3).optional() },
+  async ({ symbol, maxHops }) => {
+    if (!client_) return configErrorContent();
+    const resolved = await resolveSymbol(client_!, symbol);
+    if (!resolved.resolved) {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ resolved: false, symbol, callers: [], message: resolved.message, ...(resolved.ambiguous ? { candidates: resolved.candidates } : {}) }) }] };
+    }
+    const callers = await getCallers(client_!, resolved.node.id, maxHops ?? 3);
+    return { content: [{ type: "text" as const, text: JSON.stringify({ resolved: true, symbol, callers: callers.map((c) => ({ key: c.key, file: c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#")[0] ?? c.key, line: (() => { const parts = c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#"); const last = parts[parts.length - 1]; return parts.length >= 3 && last !== undefined && /^\d+$/.test(last) ? parseInt(last, 10) : undefined; })() })), message: `found ${callers.length} caller(s) of ${resolved.node.key}` }) }] };
+  },
+);
+
+server.tool(
+  "hydracode_callees",
+  { symbol: z.string(), maxHops: z.number().int().min(1).max(3).default(3).optional() },
+  async ({ symbol, maxHops }) => {
+    if (!client_) return configErrorContent();
+    const resolved = await resolveSymbol(client_!, symbol);
+    if (!resolved.resolved) {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ resolved: false, symbol, callees: [], message: resolved.message, ...(resolved.ambiguous ? { candidates: resolved.candidates } : {}) }) }] };
+    }
+    const callees = await getCallees(client_!, resolved.node.id, maxHops ?? 3);
+    return { content: [{ type: "text" as const, text: JSON.stringify({ resolved: true, symbol, callees: callees.map((c) => ({ key: c.key, file: c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#")[0] ?? c.key, line: (() => { const parts = c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#"); const last = parts[parts.length - 1]; return parts.length >= 3 && last !== undefined && /^\d+$/.test(last) ? parseInt(last, 10) : undefined; })() })), message: `found ${callees.length} callee(s) of ${resolved.node.key}` }) }] };
+  },
+);
+
+server.tool(
+  "hydracode_impact",
+  { symbol: z.string(), maxHops: z.number().int().min(1).max(3).default(3).optional() },
+  async ({ symbol, maxHops }) => {
+    if (!client_) return configErrorContent();
+    const resolved = await resolveSymbol(client_!, symbol);
+    if (!resolved.resolved) {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ resolved: false, symbol, callers: [], callees: [], evidence: [], message: resolved.message, ...(resolved.ambiguous ? { candidates: resolved.candidates } : {}) }) }] };
+    }
+    const hops = maxHops ?? 3;
+    const [callers, callees, rawPaths] = await Promise.all([
+      getCallers(client_!, resolved.node.id, hops),
+      getCallees(client_!, resolved.node.id, hops),
+      getPathEvidence(client_!, resolved.node.id, { relTypes: ["CALLS" as const], maxLen: hops, pathCount: 10 }),
+    ]);
+    const evidence = rawPaths.filter((p) => p.parseSucceeded).slice(0, 10).map((p) => {
+      const labels = p.nodes.map((n) => {
+        const bare = n.key.replace(/^(file|module|function|class|test|memory):/, "");
+        if (n.key.startsWith("function:") || n.key.startsWith("test:")) {
+          const parts = bare.split("#");
+          if (parts.length >= 3) return parts[parts.length - 2] ?? bare;
+        }
+        return bare;
+      });
+      let pathText: string;
+      if (p.rels && p.rels.length === p.nodes.length - 1) {
+        let t = `[${labels[0]}]`;
+        for (let i = 0; i < p.rels.length; i++) {
+          t += ` -[:${p.rels[i]}]-> [${labels[i + 1]}]`;
+        }
+        pathText = t;
+      } else {
+        pathText = labels.join(" → ");
+      }
+      return { pathText, weight: p.weight };
+    });
+    return { content: [{ type: "text" as const, text: JSON.stringify({
+      resolved: true,
+      symbol,
+      callers: callers.map((c) => ({ key: c.key, file: c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#")[0] ?? c.key, line: (() => { const parts = c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#"); const last = parts[parts.length - 1]; return parts.length >= 3 && last !== undefined && /^\d+$/.test(last) ? parseInt(last, 10) : undefined; })() })),
+      callees: callees.map((c) => ({ key: c.key, file: c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#")[0] ?? c.key, line: (() => { const parts = c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#"); const last = parts[parts.length - 1]; return parts.length >= 3 && last !== undefined && /^\d+$/.test(last) ? parseInt(last, 10) : undefined; })() })),
+      evidence,
+      message: `impact of ${resolved.node.key}: ${callers.length} callers, ${callees.length} callees, ${evidence.length} paths`,
+    }) }] };
   },
 );
 
@@ -381,6 +457,73 @@ for (const fact of supersededFacts) {
   }
 }
 console.log(`✓ hydracode_list_memory --all found ${supersededFacts.length} superseded fact(s)`);
+
+/* ---- Test 10: hydracode_callers ------------------------------------ */
+console.log("\n=== Test 10: hydracode_callers ===");
+const callersResult = await mcpClient.callTool({
+  name: "hydracode_callers",
+  arguments: { symbol: "hashToVertexId" },
+});
+const callersContent = (callersResult.content as Array<{ type: string; text: string }>)[0]?.text;
+const callersJson = JSON.parse(callersContent ?? "{}");
+console.log("Parsed:", JSON.stringify(callersJson, null, 2));
+console.assert(typeof callersJson.resolved === "boolean", "resolved must be boolean");
+console.assert(Array.isArray(callersJson.callers), "callers must be an array");
+console.assert(typeof callersJson.message === "string", "message must be a string");
+if (callersJson.resolved) {
+  for (const c of callersJson.callers) {
+    console.assert(typeof c.key === "string", "caller.key must be a string");
+    console.assert(typeof c.file === "string", "caller.file must be a string");
+  }
+  console.log(`✓ hydracode_callers found ${callersJson.callers.length} caller(s)`);
+} else {
+  console.log(`✓ hydracode_callers resolved=false: ${callersJson.message}`);
+}
+
+/* ---- Test 11: hydracode_callees ------------------------------------ */
+console.log("\n=== Test 11: hydracode_callees ===");
+const calleesResult = await mcpClient.callTool({
+  name: "hydracode_callees",
+  arguments: { symbol: "writeExtractedFiles" },
+});
+const calleesContent = (calleesResult.content as Array<{ type: string; text: string }>)[0]?.text;
+const calleesJson = JSON.parse(calleesContent ?? "{}");
+console.log("Parsed:", JSON.stringify(calleesJson, null, 2));
+console.assert(typeof calleesJson.resolved === "boolean", "resolved must be boolean");
+console.assert(Array.isArray(calleesJson.callees), "callees must be an array");
+console.assert(typeof calleesJson.message === "string", "message must be a string");
+if (calleesJson.resolved) {
+  for (const c of calleesJson.callees) {
+    console.assert(typeof c.key === "string", "callee.key must be a string");
+    console.assert(typeof c.file === "string", "callee.file must be a string");
+  }
+  console.log(`✓ hydracode_callees found ${calleesJson.callees.length} callee(s)`);
+} else {
+  console.log(`✓ hydracode_callees resolved=false: ${calleesJson.message}`);
+}
+
+/* ---- Test 12: hydracode_impact ------------------------------------- */
+console.log("\n=== Test 12: hydracode_impact ===");
+const impactResult = await mcpClient.callTool({
+  name: "hydracode_impact",
+  arguments: { symbol: "writeExtractedFiles" },
+});
+const impactContent = (impactResult.content as Array<{ type: string; text: string }>)[0]?.text;
+const impactJson = JSON.parse(impactContent ?? "{}");
+console.log("Parsed:", JSON.stringify(impactJson, null, 2));
+console.assert(typeof impactJson.resolved === "boolean", "resolved must be boolean");
+console.assert(Array.isArray(impactJson.callers), "callers must be an array");
+console.assert(Array.isArray(impactJson.callees), "callees must be an array");
+console.assert(Array.isArray(impactJson.evidence), "evidence must be an array");
+console.assert(typeof impactJson.message === "string", "message must be a string");
+if (impactJson.resolved) {
+  for (const e of impactJson.evidence) {
+    console.assert(typeof e.pathText === "string", "evidence.pathText must be a string");
+  }
+  console.log(`✓ hydracode_impact: ${impactJson.callers.length} callers, ${impactJson.callees.length} callees, ${impactJson.evidence.length} paths`);
+} else {
+  console.log(`✓ hydracode_impact resolved=false: ${impactJson.message}`);
+}
 
 /* ---- Tear down ---------------------------------------------------- */
 await mcpClient.close();

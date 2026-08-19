@@ -25,7 +25,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { loadConfig } from "../config.js";
 import { extractRepo } from "../extract/tsExtractor.js";
-import { runAskPipeline } from "../graph/askPipeline.js";
+import { runAskPipeline, resolveSymbol } from "../graph/askPipeline.js";
+import { getCallers, getCallees, getPathEvidence } from "../graph/query.js";
 import { checkDuplicateRisk } from "../graph/duplicateCheck.js";
 import { getGraphStatus } from "../graph/query.js";
 import {
@@ -401,6 +402,205 @@ server.tool(
             text: JSON.stringify({ facts, total: facts.length }),
           },
         ],
+      };
+    });
+  },
+);
+
+/* ------------------------------------------------------------------ */
+/* Tool: hydracode_callers / callees / impact                           */
+/* ------------------------------------------------------------------ */
+
+// These are thin wrappers over getCallers/getCallees/getPathEvidence which
+// already exist and are proven. The goal is giving agents explicit, typed,
+// unambiguous tools instead of routing everything through the free-text
+// `ask` pipeline. `ask` uses keyword-based intent parsing (parseAskQuery)
+// to guess intent from natural language — useful for humans. Agents calling
+// MCP tools prefer named tools with typed schemas they can reason about
+// from the name and schema alone. Both surfaces stay.
+
+server.tool(
+  "hydracode_callers",
+  "Find all functions that call a given function, up to N hops deep. " +
+    "Use this before modifying a function to understand what depends on it — " +
+    "a change to a high-caller function can break many things. Returns file " +
+    "locations and key paths for each caller.",
+  {
+    symbol: z.string().describe("Function name to look up."),
+    maxHops: z.number().int().min(1).max(3).default(3).optional()
+      .describe("Maximum traversal depth (1-3, default 3)."),
+  },
+  async ({ symbol, maxHops }) => {
+    if (configError || !client) return configErrorContent();
+    return safeCall(async () => {
+      const resolved = await resolveSymbol(client!, symbol);
+      if (!resolved.resolved) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            resolved: false,
+            symbol,
+            callers: [],
+            message: resolved.message,
+            ...(resolved.ambiguous ? { candidates: resolved.candidates } : {}),
+          }) }],
+        };
+      }
+      const callers = await getCallers(client!, resolved.node.id, maxHops ?? 3);
+      return {
+        content: [{ type: "text", text: JSON.stringify({
+          resolved: true,
+          symbol,
+          callers: callers.map((c) => ({
+            key: c.key,
+            file: c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#")[0] ?? c.key,
+            line: (() => {
+              const parts = c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#");
+              const last = parts[parts.length - 1];
+              return parts.length >= 3 && last !== undefined && /^\d+$/.test(last) ? parseInt(last, 10) : undefined;
+            })(),
+          })),
+          message: `found ${callers.length} caller(s) of ${resolved.node.key}`,
+        }) }],
+      };
+    });
+  },
+);
+
+server.tool(
+  "hydracode_callees",
+  "Find all functions that a given function calls, up to N hops deep. " +
+    "Use this to understand a function's dependencies before refactoring — " +
+    "these are the functions it relies on.",
+  {
+    symbol: z.string().describe("Function name to look up."),
+    maxHops: z.number().int().min(1).max(3).default(3).optional()
+      .describe("Maximum traversal depth (1-3, default 3)."),
+  },
+  async ({ symbol, maxHops }) => {
+    if (configError || !client) return configErrorContent();
+    return safeCall(async () => {
+      const resolved = await resolveSymbol(client!, symbol);
+      if (!resolved.resolved) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            resolved: false,
+            symbol,
+            callees: [],
+            message: resolved.message,
+            ...(resolved.ambiguous ? { candidates: resolved.candidates } : {}),
+          }) }],
+        };
+      }
+      const callees = await getCallees(client!, resolved.node.id, maxHops ?? 3);
+      return {
+        content: [{ type: "text", text: JSON.stringify({
+          resolved: true,
+          symbol,
+          callees: callees.map((c) => ({
+            key: c.key,
+            file: c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#")[0] ?? c.key,
+            line: (() => {
+              const parts = c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#");
+              const last = parts[parts.length - 1];
+              return parts.length >= 3 && last !== undefined && /^\d+$/.test(last) ? parseInt(last, 10) : undefined;
+            })(),
+          })),
+          message: `found ${callees.length} callee(s) of ${resolved.node.key}`,
+        }) }],
+      };
+    });
+  },
+);
+
+server.tool(
+  "hydracode_impact",
+  "Assess the full impact of changing a function: who calls it (callers " +
+    "that may break), what it calls (dependencies it relies on), and the " +
+    "actual call-chain paths as evidence. Call this before any significant " +
+    "refactor to understand blast radius. This is a graph traversal — it " +
+    "finds transitive dependencies that grep or semantic search cannot " +
+    "reliably surface.",
+  {
+    symbol: z.string().describe("Function name to assess."),
+    maxHops: z.number().int().min(1).max(3).default(3).optional()
+      .describe("Maximum traversal depth (1-3, default 3)."),
+  },
+  async ({ symbol, maxHops }) => {
+    if (configError || !client) return configErrorContent();
+    return safeCall(async () => {
+      const resolved = await resolveSymbol(client!, symbol);
+      if (!resolved.resolved) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            resolved: false,
+            symbol,
+            callers: [],
+            callees: [],
+            evidence: [],
+            message: resolved.message,
+            ...(resolved.ambiguous ? { candidates: resolved.candidates } : {}),
+          }) }],
+        };
+      }
+      const hops = maxHops ?? 3;
+      const [callers, callees, rawPaths] = await Promise.all([
+        getCallers(client!, resolved.node.id, hops),
+        getCallees(client!, resolved.node.id, hops),
+        getPathEvidence(client!, resolved.node.id, {
+          relTypes: ["CALLS" as const],
+          maxLen: hops,
+          pathCount: 10,
+        }),
+      ]);
+      const evidence = rawPaths
+        .filter((p) => p.parseSucceeded)
+        .slice(0, 10)
+        .map((p) => {
+          const labels = p.nodes.map((n) => {
+            const bare = n.key.replace(/^(file|module|function|class|test|memory):/, "");
+            if (n.key.startsWith("function:") || n.key.startsWith("test:")) {
+              const parts = bare.split("#");
+              if (parts.length >= 3) return parts[parts.length - 2] ?? bare;
+            }
+            return bare;
+          });
+          let pathText: string;
+          if (p.rels && p.rels.length === p.nodes.length - 1) {
+            let t = `[${labels[0]}]`;
+            for (let i = 0; i < p.rels.length; i++) {
+              t += ` -[:${p.rels[i]}]-> [${labels[i + 1]}]`;
+            }
+            pathText = t;
+          } else {
+            pathText = labels.join(" → ");
+          }
+          return { pathText, weight: p.weight };
+        });
+      return {
+        content: [{ type: "text", text: JSON.stringify({
+          resolved: true,
+          symbol,
+          callers: callers.map((c) => ({
+            key: c.key,
+            file: c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#")[0] ?? c.key,
+            line: (() => {
+              const parts = c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#");
+              const last = parts[parts.length - 1];
+              return parts.length >= 3 && last !== undefined && /^\d+$/.test(last) ? parseInt(last, 10) : undefined;
+            })(),
+          })),
+          callees: callees.map((c) => ({
+            key: c.key,
+            file: c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#")[0] ?? c.key,
+            line: (() => {
+              const parts = c.key.replace(/^(file|module|function|class|test|memory):/, "").split("#");
+              const last = parts[parts.length - 1];
+              return parts.length >= 3 && last !== undefined && /^\d+$/.test(last) ? parseInt(last, 10) : undefined;
+            })(),
+          })),
+          evidence,
+          message: `impact of ${resolved.node.key}: ${callers.length} callers, ${callees.length} callees, ${evidence.length} paths`,
+        }) }],
       };
     });
   },
