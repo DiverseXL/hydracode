@@ -3,6 +3,7 @@
 import fs from "node:fs";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { Command } from "commander";
 import pc from "picocolors";
@@ -24,6 +25,18 @@ import { buildVisualizationData, renderVisualizationHtml } from "./graph/visuali
 import { HydraClient } from "./hydra/client.js";
 import { HydraConnectionError, HydraQueryError } from "./hydra/errors.js";
 
+const require = createRequire(import.meta.url);
+const { version } = require("../package.json") as { version: string };
+
+const BANNER = `  ██╗  ██╗██╗   ██╗██████╗ ██████╗  █████╗  ██████╗ ██████╗ ██████╗ ███████╗
+  ██║  ██║╚██╗ ██╔╝██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔═══██╗██╔══██╗██╔════╝
+  ███████║ ╚████╔╝ ██║  ██║██████╔╝███████║██║     ██║   ██║██║  ██║█████╗
+  ██╔══██║  ╚██╔╝  ██║  ██║██╔══██╗██╔══██║██║     ██║   ██║██║  ██║██╔══╝
+  ██║  ██║   ██║   ██████╔╝██║  ██║██║  ██║╚██████╗╚██████╔╝██████╔╝███████╗
+  ╚═╝  ╚═╝   ╚═╝   ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═════╝╚══════╝
+  HydraDB-backed code graph for AI coding agents
+  ${pc.dim(`v${version} · github.com/DiverseXL/hydracode · Hack Hydra 2026 · Track 02B`)}`;
+
 const program = new Command();
 
 program
@@ -31,7 +44,9 @@ program
   .description(
     "Index a codebase into a HydraDB graph for AI coding agents: multi-hop, relationship-aware context plus a temporal memory layer.",
   )
-  .version("0.1.0");
+  .version(version);
+
+program.addHelpText("beforeAll", `\n${pc.cyan(BANNER)}\n\n`);
 
 program.addHelpText("after", `
 ${pc.dim("─────────────────────────────────────────────────")}
@@ -63,6 +78,15 @@ ${pc.bold("Agents")}
 ${pc.dim("─────────────────────────────────────────────────")}
 Run ${pc.cyan("hydracode <command> --help")} for detailed options.
 `);
+
+// Print a slim version marker to stderr on every subcommand invocation.
+// Excluded for the `mcp` command because its stdio transport owns stdout
+// and anything else on stdout would corrupt the connection.
+program.hook("preAction", (_thisCommand, actionCommand) => {
+  if (process.argv[2] !== "mcp") {
+    process.stderr.write(pc.dim(`hydracode v${version}\n`));
+  }
+});
 
 const DEFAULT_INDEX_PATTERNS = "**/*.{ts,tsx,js,jsx}";
 
