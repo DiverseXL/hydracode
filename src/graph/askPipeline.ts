@@ -18,7 +18,7 @@ import {
   MAX_HOPS,
 } from "./query.js";
 import type { GraphNodeRef } from "./query.js";
-import { NODE_LABELS } from "./schema.js";
+import { NODE_LABELS, REL_TYPES } from "./schema.js";
 import { recallMemoryFacts } from "../memory/store.js";
 
 /* ------------------------------------------------------------------ */
@@ -84,6 +84,14 @@ export interface AskPipelineResult {
     text: string;
     about: string[];
     createdAt: string;
+  }[];
+  /** Security findings affecting the anchor node. */
+  securityFindings?: {
+    key: string;
+    ruleId: string;
+    message: string;
+    severity: string;
+    location: string;
   }[];
 }
 
@@ -243,6 +251,36 @@ export async function runAskPipeline(
     );
   }
 
+  // Step 7: Security findings — fetch findings affecting the anchor node.
+  // Security enrichment is best-effort; omit on failure.
+  let securityFindings: AskPipelineResult["securityFindings"];
+  try {
+    const secRes = await client.query(
+      `MATCH (s:${NODE_LABELS.SECURITY_FINDING})-[:${REL_TYPES.AFFECTS}]->(n {id: $anchorId})
+       RETURN s.key AS key, s.ruleId AS ruleId, s.message AS message,
+              s.severity AS severity, s.uri AS uri, s.startLine AS startLine
+       LIMIT 5`,
+      { anchorId: anchor.id },
+      { consistency: "strong" },
+    );
+    if (secRes.rows.length > 0) {
+      securityFindings = secRes.rows.map((row) => {
+        const cells = row as unknown[];
+        return {
+          key: unwrapCell(cells[0]),
+          ruleId: unwrapCell(cells[1]),
+          message: unwrapCell(cells[2]),
+          severity: unwrapCell(cells[3]),
+          location: `${unwrapCell(cells[4])}:${unwrapCell(cells[5])}`,
+        };
+      });
+    }
+  } catch (err) {
+    process.stderr.write(
+      `[askPipeline] security enrichment failed: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  }
+
   const result: AskPipelineResult = {
     resolved: true,
     anchor: { key: anchor.key, label: anchor.label },
@@ -254,7 +292,20 @@ export async function runAskPipeline(
   if (relatedMemory !== undefined) {
     result.relatedMemory = relatedMemory;
   }
+  if (securityFindings !== undefined) {
+    result.securityFindings = securityFindings;
+  }
   return result;
+}
+
+/** Unwrap a HydraDB row cell value. */
+function unwrapCell(v: unknown): string {
+  if (v === null || typeof v !== "object") return String(v ?? "");
+  const record = v as Record<string, unknown>;
+  if (typeof record.type === "string" && "value" in record) {
+    return String(record.value ?? "");
+  }
+  return String(v);
 }
 
 /* ------------------------------------------------------------------ */

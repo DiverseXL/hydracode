@@ -56,6 +56,8 @@ export const NODE_LABELS = {
   TEST: "Test",
   /** Memory layer (Track 03) — kept here so one import serves both. */
   MEMORY_FACT: "MemoryFact",
+  /** Security analysis findings imported from SARIF. */
+  SECURITY_FINDING: "SecurityFinding",
 } as const;
 
 export type NodeLabel = (typeof NODE_LABELS)[keyof typeof NODE_LABELS];
@@ -84,6 +86,8 @@ export const REL_TYPES = {
   SUPERSEDED_BY: "SUPERSEDED_BY", // MemoryFact -> MemoryFact (explicit update: old -> new)
   CONTRADICTS: "CONTRADICTS", // MemoryFact -> MemoryFact (symmetric conflict)
   ABOUT: "ABOUT", // MemoryFact -> Function | ClassEntity | File (optional)
+  // Security graph
+  AFFECTS: "AFFECTS", // SecurityFinding -> Function | File
 } as const;
 
 export type RelType = (typeof REL_TYPES)[keyof typeof REL_TYPES];
@@ -215,5 +219,28 @@ export interface MemoryFactNode {
   status: MemoryFactStatus;
 }
 
+/** A security finding imported from a SARIF report. */
+export interface SecurityFindingNode {
+  /**
+   * LOGICAL KEY — `finding:${ruleId}#${uri}#${startLine}`, the type-prefixed
+   * string that is this finding's identity in the global id space.
+   */
+  key: string;
+  ruleId: string;
+  message: string;
+  severity: "error" | "warning" | "note" | "none";
+  uri: string;
+  startLine: number;
+  endLine: number;
+  tool: string;
+}
+
+/**
+ * AFFECTS edges link a SecurityFinding to the Function node whose line
+ * range contains the finding's startLine (if one exists in the graph),
+ * AND always to the File node for the finding's uri (file-level link
+ * as fallback when no Function contains the line).
+ */
+
 /** Union of every node hydracode writes to HydraDB. */
-export type AnyGraphNode = CodeGraphNode | MemoryFactNode;
+export type AnyGraphNode = CodeGraphNode | MemoryFactNode | SecurityFindingNode;

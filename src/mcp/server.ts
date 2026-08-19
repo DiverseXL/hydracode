@@ -36,6 +36,8 @@ import {
   listMemoryFacts,
 } from "../memory/store.js";
 import { writeExtractedFiles } from "../graph/writer.js";
+import { parseSarif } from "../extract/sarifParser.js";
+import { writeFindings } from "../graph/sarifWriter.js";
 import { HydraClient } from "../hydra/client.js";
 
 /* ------------------------------------------------------------------ */
@@ -133,7 +135,8 @@ server.tool(
     "you need to know what calls a function, what a function calls, or how two pieces of " +
     "code are actually connected. Returns evidence (actual call paths), not just a list. " +
     "Also returns related memory facts (decisions, conventions) recorded ABOUT the queried " +
-    "function or its neighbors — so you get structure and team context in one call. " +
+    "function or its neighbors, and any security findings (from SARIF imports) that affect " +
+    "the function — so you get structure, team context, and vulnerability info in one call. " +
     "Run hydracode_index first if the repository hasn't been indexed yet.",
   {
     question: z
@@ -602,6 +605,70 @@ server.tool(
           })),
           evidence,
           message: `impact of ${resolved.node.key}: ${callers.length} callers, ${callees.length} callees, ${evidence.length} paths`,
+        }) }],
+      };
+    });
+  },
+);
+
+/* ------------------------------------------------------------------ */
+/* Tool: hydracode_import_sarif                                        */
+/* ------------------------------------------------------------------ */
+
+server.tool(
+  "hydracode_import_sarif",
+  "Import SARIF security analysis results into the code graph. Findings are " +
+    "linked to the functions and files they affect, so impact queries include " +
+    "vulnerability context. Pass the raw SARIF JSON content as a string. " +
+    "Run hydracode index first so findings can be linked to real function nodes.",
+  {
+    content: z
+      .string()
+      .describe("Raw SARIF JSON content as a string."),
+    tool: z
+      .string()
+      .optional()
+      .describe("Override tool name from SARIF (optional)."),
+  },
+  async ({ content, tool: toolOverride }) => {
+    if (configError || !client) return configErrorContent();
+    return safeCall(async () => {
+      let sarifJson: unknown;
+      try {
+        sarifJson = JSON.parse(content);
+      } catch {
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            error: "parse_error",
+            message: "Invalid JSON in SARIF content",
+          }) }],
+        };
+      }
+
+      const repoRoot = process.cwd();
+      let findings = parseSarif(sarifJson, repoRoot);
+
+      if (toolOverride) {
+        findings = findings.map((f) => ({ ...f, tool: toolOverride }));
+      }
+
+      if (findings.length === 0) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            findingsWritten: 0,
+            affectsFileEdges: 0,
+            affectsFunctionEdges: 0,
+            skippedNoLocation: 0,
+            message: "No findings found in SARIF content",
+          }) }],
+        };
+      }
+
+      const summary = await writeFindings(findings, client!, { quiet: true });
+      return {
+        content: [{ type: "text", text: JSON.stringify({
+          ...summary,
+          message: `imported ${summary.findingsWritten} findings from ${findings[0]?.tool ?? toolOverride ?? "unknown"}`,
         }) }],
       };
     });

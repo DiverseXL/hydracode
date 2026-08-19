@@ -13,10 +13,13 @@ import { runAskPipeline, describeKey, chainDisplay, resolveSymbol } from "./grap
 import type { AskResultNode, AskEvidencePath } from "./graph/askPipeline.js";
 import { runInstall } from "./install.js";
 import { getGraphStatus, getCallers, getCallees, getPathEvidence, MAX_HOPS } from "./graph/query.js";
+import { NODE_LABELS, REL_TYPES } from "./graph/schema.js";
 import { buildGraphSummary, renderAgentsMdSection, MARKER_START, MARKER_END } from "./graph/agentsSummary.js";
 import { checkDuplicateRisk, functionNameFromKey } from "./graph/duplicateCheck.js";
 import { recordKnownDuplicate, recordMemoryFactAbout, recallMemoryFacts, listMemoryFacts } from "./memory/store.js";
 import { writeExtractedFiles } from "./graph/writer.js";
+import { parseSarif } from "./extract/sarifParser.js";
+import { writeFindings } from "./graph/sarifWriter.js";
 import { buildVisualizationData, renderVisualizationHtml } from "./graph/visualize.js";
 import { HydraClient } from "./hydra/client.js";
 import { HydraConnectionError, HydraQueryError } from "./hydra/errors.js";
@@ -39,6 +42,7 @@ ${pc.bold("Indexing")}
   ${pc.cyan("status")}                                      Show graph counts
   ${pc.cyan("init-hooks")}                                  Install git post-commit hook
   ${pc.cyan("visualize [--output]")}                        Export graph as interactive HTML
+  ${pc.cyan("import-sarif <file> [--tool]")}                Import SARIF security findings
 
 ${pc.bold("Querying")}
   ${pc.cyan("callers <symbol> [--max-hops]")}         Who calls this function (transitive)
@@ -319,6 +323,23 @@ program
         } else {
           console.log(pc.dim(`    recorded ${dateStr}`));
         }
+      }
+    }
+
+    // Security findings affecting the anchor node.
+    const secFindings = result.securityFindings;
+    if (secFindings !== undefined && secFindings.length > 0) {
+      console.log(pc.dim(`\nsecurity findings (${secFindings.length})`));
+      for (const f of secFindings) {
+        const sevColor = f.severity === "error"
+          ? pc.red
+          : f.severity === "warning"
+            ? pc.yellow
+            : pc.dim;
+        console.log(
+          `  ${sevColor("\u26a0")} ${pc.bold(f.ruleId)} (${sevColor(f.severity)}) — ${pc.cyan(f.location)}`,
+        );
+        console.log(pc.dim(`    "${f.message}"`));
       }
     }
   });
@@ -1064,6 +1085,135 @@ program
           `  ${rendered}${p.weight !== undefined ? pc.dim(`  (weight ${p.weight})`) : ""}`,
         );
       }
+    }
+
+    // SECURITY FINDINGS section
+    try {
+      const secRes = await client.query(
+        `MATCH (s:${NODE_LABELS.SECURITY_FINDING})-[:${REL_TYPES.AFFECTS}]->(n {id: $anchorId})
+         RETURN s.key AS key, s.ruleId AS ruleId, s.message AS message,
+                s.severity AS severity, s.uri AS uri, s.startLine AS startLine
+         LIMIT 5`,
+        { anchorId: resolved.node.id },
+        { consistency: "strong" },
+      );
+      if (secRes.rows.length > 0) {
+        console.log(pc.bold(`SECURITY FINDINGS (${secRes.rows.length})`));
+        for (const row of secRes.rows) {
+          const cells = row as unknown[];
+          const ruleId = unwrapCli(cells[1]);
+          const message = unwrapCli(cells[2]);
+          const severity = unwrapCli(cells[3]);
+          const uri = unwrapCli(cells[4]);
+          const startLine = unwrapCli(cells[5]);
+          const sevColor = severity === "error" ? pc.red : severity === "warning" ? pc.yellow : pc.dim;
+          console.log(`  ${sevColor("\u26a0")} ${pc.bold(ruleId)} (${sevColor(severity)}) — ${pc.cyan(`${uri}:${startLine}`)}`);
+          console.log(pc.dim(`    "${message}"`));
+        }
+      }
+    } catch {
+      // Security enrichment is best-effort for impact too.
+    }
+
+    // RELATED DECISIONS section
+    try {
+      const nearName = resolved.node.name ?? describeKey(resolved.node.key).split(":")[0];
+      if (nearName && nearName.length > 0) {
+        const memFacts = await recallMemoryFacts(client, { nearNode: nearName, query: "" });
+        if (memFacts.length > 0) {
+          const sorted = memFacts.sort((a, b) => b.trust - a.trust || b.createdAt.localeCompare(a.createdAt)).slice(0, 3);
+          console.log(pc.dim("\nrelated decisions"));
+          for (const f of sorted) {
+            const shortKey = f.key.replace("memory:", "").substring(0, 8);
+            const dateStr = f.createdAt.split("T")[0];
+            console.log(`  ${pc.green(`\u2022 memory:${shortKey}`)}  ${pc.dim(`"${f.text.substring(0, 60)}${f.text.length > 60 ? "\u2026" : ""}"`)}`);
+            if (f.about.length > 0) {
+              console.log(pc.dim(`    about: ${f.about.join(", ")} \u00b7 recorded ${dateStr}`));
+            } else {
+              console.log(pc.dim(`    recorded ${dateStr}`));
+            }
+          }
+        }
+      }
+    } catch {
+      // Memory enrichment is best-effort.
+    }
+  });
+
+/** Unwrap a HydraDB row cell value for CLI rendering. */
+function unwrapCli(v: unknown): string {
+  if (v === null || typeof v !== "object") return String(v ?? "");
+  const record = v as Record<string, unknown>;
+  if (typeof record.type === "string" && "value" in record) return String(record.value ?? "");
+  return String(v);
+}
+
+program
+  .command("import-sarif")
+  .description("Import SARIF security analysis results into the code graph")
+  .argument("<file>", "path to a SARIF JSON file")
+  .option("--tool <name>", "override tool name from SARIF")
+  .action(async (file: string, opts: { tool?: string }) => {
+    try {
+      const config = loadConfig();
+      const client = new HydraClient(config);
+
+      console.log(pc.bold("hydracode import-sarif"));
+      console.log();
+
+      // Read and parse the SARIF file.
+      const absPath = path.resolve(file);
+      if (!fs.existsSync(absPath)) {
+        console.error(pc.red(`error: file not found: ${absPath}`));
+        process.exitCode = 1;
+        return;
+      }
+
+      let sarifJson: unknown;
+      try {
+        const content = fs.readFileSync(absPath, "utf8");
+        sarifJson = JSON.parse(content);
+      } catch (err) {
+        console.error(pc.red(`error: failed to parse SARIF file: ${err instanceof Error ? err.message : String(err)}`));
+        process.exitCode = 1;
+        return;
+      }
+
+      const repoRoot = process.cwd();
+      let findings = parseSarif(sarifJson, repoRoot);
+
+      // Override tool name if --tool is provided.
+      if (opts.tool) {
+        findings = findings.map((f) => ({ ...f, tool: opts.tool! }));
+      }
+
+      if (findings.length === 0) {
+        console.log(pc.yellow("no findings found in SARIF file"));
+        return;
+      }
+
+      // Check if graph is indexed.
+      const { getGraphStatus } = await import("./graph/query.js");
+      const status = await getGraphStatus(client);
+      if (!status.indexed) {
+        console.log(pc.yellow("warning: no indexed files found — run `hydracode index` first, AFFECTS edges to functions/files will be empty"));
+      }
+
+      const summary = await writeFindings(findings, client, { quiet: true });
+
+      console.log(pc.green(`\n\u2713 imported ${summary.findingsWritten} findings from ${findings[0]?.tool ?? opts.tool ?? "unknown"}`));
+      console.log(pc.dim(`  ${summary.affectsFunctionEdges} linked to functions · ${summary.affectsFileEdges} linked to files · ${summary.skippedNoLocation} skipped`));
+    } catch (err) {
+      if (err instanceof HydraConnectionError) {
+        console.error(pc.red(`\nerror: ${err.message}`));
+      } else if (err instanceof HydraQueryError) {
+        console.error(
+          pc.red(`\nerror: HydraDB rejected a query (HTTP ${err.status}): ${err.body}`),
+        );
+      } else {
+        console.error(pc.red(`\nerror: ${err instanceof Error ? err.message : String(err)}`));
+      }
+      process.exitCode = 1;
     }
   });
 

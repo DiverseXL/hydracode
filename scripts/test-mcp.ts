@@ -24,6 +24,8 @@ import {
 } from "../src/memory/store.js";
 import { extractRepo } from "../src/extract/tsExtractor.js";
 import { writeExtractedFiles } from "../src/graph/writer.js";
+import { parseSarif } from "../src/extract/sarifParser.js";
+import { writeFindings } from "../src/graph/sarifWriter.js";
 
 /* ---- Build the same server that startMcpServer() uses ------------- */
 const { version } = (await import("../package.json", {
@@ -215,6 +217,30 @@ server.tool(
       evidence,
       message: `impact of ${resolved.node.key}: ${callers.length} callers, ${callees.length} callees, ${evidence.length} paths`,
     }) }] };
+  },
+);
+
+server.tool(
+  "hydracode_import_sarif",
+  { content: z.string(), tool: z.string().optional() },
+  async ({ content, tool: toolOverride }) => {
+    if (!client_) return configErrorContent();
+    let sarifJson: unknown;
+    try {
+      sarifJson = JSON.parse(content);
+    } catch {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ error: "parse_error", message: "Invalid JSON" }) }] };
+    }
+    const repoRoot = process.cwd();
+    let findings = parseSarif(sarifJson, repoRoot);
+    if (toolOverride) {
+      findings = findings.map((f) => ({ ...f, tool: toolOverride }));
+    }
+    if (findings.length === 0) {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ findingsWritten: 0, message: "No findings" }) }] };
+    }
+    const summary = await writeFindings(findings, client_!, { quiet: true });
+    return { content: [{ type: "text" as const, text: JSON.stringify({ ...summary, message: `imported ${summary.findingsWritten} findings` }) }] };
   },
 );
 
@@ -547,6 +573,39 @@ if (impactJson.resolved) {
 } else {
   console.log(`✓ hydracode_impact resolved=false: ${impactJson.message}`);
 }
+
+/* ---- Test 13: hydracode_import_sarif ------------------------------- */
+console.log("\n=== Test 13: hydracode_import_sarif ===");
+const sarifPayload = JSON.stringify({
+  version: "2.1.0",
+  runs: [{
+    tool: { driver: { name: "mcp-test-scanner" } },
+    results: [{
+      ruleId: "test-rule",
+      message: { text: "Test finding from MCP" },
+      level: "warning",
+      locations: [{
+        physicalLocation: {
+          artifactLocation: { uri: "src/graph/writer.ts" },
+          region: { startLine: 503, endLine: 503 },
+        },
+      }],
+    }],
+  }],
+});
+const importResult = await mcpClient.callTool({
+  name: "hydracode_import_sarif",
+  arguments: { content: sarifPayload },
+});
+const importContent = (importResult.content as Array<{ type: string; text: string }>)[0]?.text;
+const importJson = JSON.parse(importContent ?? "{}");
+console.log("Parsed:", JSON.stringify(importJson, null, 2));
+console.assert(typeof importJson.findingsWritten === "number", "findingsWritten must be a number");
+console.assert(importJson.findingsWritten > 0, "should have written at least one finding");
+console.assert(typeof importJson.affectsFileEdges === "number", "affectsFileEdges must be a number");
+console.assert(typeof importJson.affectsFunctionEdges === "number", "affectsFunctionEdges must be a number");
+console.assert(typeof importJson.message === "string", "message must be a string");
+console.log(`✓ hydracode_import_sarif: ${importJson.findingsWritten} findings, ${importJson.affectsFileEdges} file edges, ${importJson.affectsFunctionEdges} function edges`);
 
 /* ---- Tear down ---------------------------------------------------- */
 await mcpClient.close();
