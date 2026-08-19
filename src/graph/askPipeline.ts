@@ -19,6 +19,7 @@ import {
 } from "./query.js";
 import type { GraphNodeRef } from "./query.js";
 import { NODE_LABELS } from "./schema.js";
+import { recallMemoryFacts } from "../memory/store.js";
 
 /* ------------------------------------------------------------------ */
 /* Public result types                                                  */
@@ -77,6 +78,13 @@ export interface AskPipelineResult {
    */
   message?: string;
   intent?: "callers" | "callees" | "tests" | "general";
+  /** Memory facts about the anchor node or its immediate call neighbors. */
+  relatedMemory?: {
+    key: string;
+    text: string;
+    about: string[];
+    createdAt: string;
+  }[];
 }
 
 /* ------------------------------------------------------------------ */
@@ -203,7 +211,39 @@ export async function runAskPipeline(
       ? `no ${intentVerb} found for ${anchorDisplay}`
       : `found ${results.length} ${intentVerb} for ${anchorDisplay}`;
 
-  return {
+  // Step 6: Memory enrichment — fetch facts about the anchor or its neighbors.
+  // Memory is additive; if recall fails, omit rather than breaking the ask.
+  let relatedMemory: AskPipelineResult["relatedMemory"];
+  try {
+    // Extract the function name from the anchor key for nearNode lookup.
+    // Key format: `function:src/a.ts#writeExtractedFiles#503` → `writeExtractedFiles`
+    const nearName = anchor.name ?? pathSegmentDisplay(anchor.key);
+    if (nearName.length > 0) {
+      const memoryFacts = await recallMemoryFacts(client, {
+        nearNode: nearName,
+        query: "",
+      });
+      if (memoryFacts.length > 0) {
+        // Cap at 3: sort by trust (desc), then recency (desc).
+        const sorted = memoryFacts
+          .sort((a, b) => b.trust - a.trust || b.createdAt.localeCompare(a.createdAt))
+          .slice(0, 3);
+        relatedMemory = sorted.map((f) => ({
+          key: f.key,
+          text: f.text,
+          about: f.about,
+          createdAt: f.createdAt,
+        }));
+      }
+    }
+  } catch (err) {
+    // Memory enrichment is best-effort — log to stderr, never fail the ask.
+    process.stderr.write(
+      `[askPipeline] memory enrichment failed: ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  }
+
+  const result: AskPipelineResult = {
     resolved: true,
     anchor: { key: anchor.key, label: anchor.label },
     intent,
@@ -211,6 +251,10 @@ export async function runAskPipeline(
     evidence,
     message,
   };
+  if (relatedMemory !== undefined) {
+    result.relatedMemory = relatedMemory;
+  }
+  return result;
 }
 
 /* ------------------------------------------------------------------ */

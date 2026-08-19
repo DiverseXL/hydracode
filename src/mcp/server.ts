@@ -132,6 +132,8 @@ server.tool(
     "containment, and structure. Use this instead of guessing from code similarity when " +
     "you need to know what calls a function, what a function calls, or how two pieces of " +
     "code are actually connected. Returns evidence (actual call paths), not just a list. " +
+    "Also returns related memory facts (decisions, conventions) recorded ABOUT the queried " +
+    "function or its neighbors — so you get structure and team context in one call. " +
     "Run hydracode_index first if the repository hasn't been indexed yet.",
   {
     question: z

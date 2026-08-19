@@ -253,6 +253,29 @@ console.log("Parsed:", JSON.stringify(askJson, null, 2));
 console.assert(typeof askJson.resolved === "boolean", "resolved must be boolean");
 console.log(`✓ hydracode_ask resolved=${askJson.resolved}, message="${askJson.message}"`);
 
+/* ---- Test 3b: hydracode_ask with relatedMemory -------------------- */
+console.log("\n=== Test 3b: hydracode_ask with relatedMemory ===");
+const askMemResult = await mcpClient.callTool({
+  name: "hydracode_ask",
+  arguments: { question: "what does writeExtractedFiles call", maxHops: 3 },
+});
+const askMemContent = (askMemResult.content as Array<{ type: string; text: string }>)[0]?.text;
+const askMemJson = JSON.parse(askMemContent ?? "{}");
+console.log("relatedMemory:", JSON.stringify(askMemJson.relatedMemory ?? null, null, 2));
+if (askMemJson.relatedMemory) {
+  console.assert(Array.isArray(askMemJson.relatedMemory), "relatedMemory must be an array");
+  console.assert(askMemJson.relatedMemory.length > 0, "relatedMemory should have at least one entry");
+  for (const f of askMemJson.relatedMemory) {
+    console.assert(typeof f.key === "string" && f.key.startsWith("memory:"), "fact key must be memory:<uuid>");
+    console.assert(typeof f.text === "string", "fact text must be a string");
+    console.assert(typeof f.createdAt === "string", "fact createdAt must be a string");
+    console.assert(Array.isArray(f.about), "fact about must be an array");
+  }
+  console.log(`✓ hydracode_ask returned ${askMemJson.relatedMemory.length} related memory fact(s)`);
+} else {
+  console.log("✓ hydracode_ask returned no relatedMemory (no facts found — acceptable)");
+}
+
 /* ---- Test 4: hydracode_check_duplicate ---------------------------- */
 const dupCases = [
   { name: "writeExtractedFiles" },

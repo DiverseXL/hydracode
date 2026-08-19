@@ -302,6 +302,25 @@ program
         console.log(pc.dim("  … (capped at 8 paths)"));
       }
     }
+
+    // Related decisions (memory facts about the anchor or its neighbors).
+    const mem = result.relatedMemory;
+    if (mem !== undefined && mem.length > 0) {
+      console.log(pc.dim(`\nrelated decisions`));
+      for (const f of mem) {
+        const shortKey = f.key.replace("memory:", "").substring(0, 8);
+        const dateStr = f.createdAt.split("T")[0];
+        const aboutStr = f.about.length > 0 ? f.about.join(", ") : "";
+        console.log(
+          `  ${pc.green(`\u2022 memory:${shortKey}`)}  ${pc.dim(`"${f.text.substring(0, 60)}${f.text.length > 60 ? "\u2026" : ""}"`)}`,
+        );
+        if (aboutStr.length > 0) {
+          console.log(pc.dim(`    about: ${aboutStr} \u00b7 recorded ${dateStr}`));
+        } else {
+          console.log(pc.dim(`    recorded ${dateStr}`));
+        }
+      }
+    }
   });
 
 program
