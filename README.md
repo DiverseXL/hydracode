@@ -2,7 +2,22 @@
 
 **Turn any codebase into a queryable knowledge graph in [HydraDB](https://github.com/hydra-db/hydradb) — so AI coding agents get real call-chain evidence instead of embedding-similarity guesses.**
 
-Built for [Hack Hydra](https://hackhydra.hydradb.com) (Track 02B: Repos, Dependencies & Code as Graphs).
+---
+
+## Hack Hydra submission
+
+| | |
+|---|---|
+| **Primary track** | 02B — Repos, Dependencies & Code as Graphs |
+| **Secondary track** | 03 — Memory & Context Retrieval (memory facts + `SUPERSEDED_BY` + deliberate-duplicate recording) |
+| **Demo video** | <!-- DEMO: add URL --> |
+
+**What judges should look at in the 3-minute video:**
+
+1. `hydracode index` — walks the repo, parses every `.ts`/`.js` file, writes real nodes (File / Function / Class) + edges (CONTAINS / CALLS / IMPORTS) into HydraDB as a graph
+2. `hydracode ask "who calls writeExtractedFiles"` — multi-hop graph traversal returns the actual call-chain evidence (not a similarity guess)
+3. `hydracode check-duplicate "writeExtractedFiles"` — flags existing near-duplicates *before* an agent writes redundant code
+4. MCP tool call — same graph query through the Model Context Protocol, verified working with Grok Build (`grok mcp doctor hydracode` → handshake OK, 11 tools)
 
 ---
 
@@ -151,6 +166,24 @@ export HYDRACODE_HYDRADB_ALLOW_PLAINTEXT=true
 
 Or use a project-level `.hydracode/config.json` (gitignored) — see `src/config.ts` for the full schema, including TLS/production mode (`allowPlaintext: false` + `https://` URI + a real bearer token).
 
+### ⚡ 60-second quick start
+
+Once HydraDB is running and the env vars are set, try these four commands to see the full pipeline in action:
+
+```bash
+# 1. Index this repo (writes real nodes + edges into HydraDB)
+node dist/cli.js index .
+
+# 2. Ask a structural question — returns actual call-chain evidence
+node dist/cli.js ask "who calls writeExtractedFiles"
+
+# 3. Check if a name already exists — catches near-duplicates
+node dist/cli.js check-duplicate "writeExtractedFiles"
+
+# 4. Try a name that definitely doesn't exist — confirms the safe path
+node dist/cli.js check-duplicate "calculateFooBarBaz123"
+```
+
 ### 4. Index your project
 
 ```bash
@@ -165,11 +198,26 @@ node dist/cli.js ask "who calls writeExtractedFiles"
 
 ### 6. Wire it into your coding agent
 
+**Cursor / Claude Code** (auto-detect):
+
 ```bash
 node dist/cli.js install
 ```
 
 Auto-detects and writes MCP config for Cursor (`.cursor/mcp.json`) and Claude Code (`.mcp.json` / `~/.claude.json`), merging with any existing servers rather than overwriting. Restart your agent afterward to pick it up.
+
+**Grok Build:**
+
+```bash
+# After build:
+grok mcp add hydracode -- node dist/mcp/server.js
+
+# Or without building (dev mode):
+grok mcp add hydracode -- npx tsx src/mcp/server.ts
+
+# Verify:
+grok mcp doctor hydracode   # should show handshake OK, 11 tools
+```
 
 ---
 
@@ -282,7 +330,20 @@ The same memory operations are available as MCP tools for coding agents:
 
 ---
 
-## How this uses HydraDB
+## How HydraDB is used (meaningful, not decorative)
+
+hydracode is useless without HydraDB's graph model. Vectors alone cannot answer "who calls this function, transitively, three hops out" — that requires a native graph traversal. Here's what HydraDB actually does:
+
+- **Code entities as nodes.** Every file, function, class, test, and module is a real node in HydraDB with an integer id (HydraDB requires non-negative integer ids — strings are rejected). Logical keys like `function:src/graph/writer.ts#writeExtractedFiles#503` are hashed to integers at write time and stored as a `key` property for human readability.
+- **Relationships as edges.** `CONTAINS` (file → function/class/test), `CALLS` (function → function), `IMPORTS` (file → module), `EXTENDS` (class → class), `METHOD_OF` (function → class) — all written as typed edges with their own integer ids.
+- **Writes are idempotent `UNWIND $rows` + `MERGE`.** Re-running `index` updates existing nodes instead of duplicating them. A per-file garbage-collection pass removes stale node versions left behind by edits.
+- **Reads are multi-hop graph traversals.** Variable-length `MATCH (*1..3)` for reachable-endpoint questions ("who calls X?"). `algo.SSpaths` when actual path structure is needed as evidence. These are native HydraDB operations — not a BFS written in JS.
+- **Memory facts live in the same graph.** `MemoryFact` nodes are linked to code via `ABOUT` edges (e.g. `MemoryFact -[:ABOUT]-> Function`). `SUPERSEDED_BY` edges connect old decisions to their replacements. Proximity recall traverses `CALLS` + `CONTAINS` from an anchor to find all neighboring node ids, then fetches memory facts pointing at any of them — a query structurally impossible for a flat store.
+- **Security findings are graph-connected too.** `SecurityFinding` nodes link to `Function` and `File` via `AFFECTS` edges. "Which vulnerabilities affect my call chain?" is the same graph traversal as "what's the blast radius of changing this function."
+
+> **hydracode is a HydraDB application, not a HydraDB wrapper.** The entire value proposition — call-chain evidence, proximity recall, duplicate detection, impact analysis — is delivered through HydraDB's graph engine. Without it, there is no multi-hop traversal, no path evidence, no memory-to-code linkage.
+
+### Developer details (if you're extending this)
 
 HydraDB isn't incidental — it's the storage and query engine for the entire project. A few things worth knowing if you're extending this:
 
