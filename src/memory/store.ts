@@ -629,6 +629,47 @@ RETURN m.id AS factId, newer.key AS newerKey`,
 	return facts;
 }
 
+/**
+ * Delete all MemoryFact nodes whose keys are NOT in the keepKeys set.
+ * Also detaches ABOUT and SUPERSEDED_BY edges from deleted nodes.
+ * Returns the count of facts deleted.
+ */
+export async function cleanMemoryFacts(
+	client: HydraClient,
+	keepKeys: string[],
+): Promise<number> {
+	// Fetch all active MemoryFact keys
+	const res = await client.query(
+		`MATCH (m:${NODE_LABELS.MEMORY_FACT}) RETURN m.key AS key`,
+		undefined,
+		{ consistency: "strong" },
+	);
+
+	const keepSet = new Set(keepKeys);
+	const toDelete: string[] = [];
+	for (const row of res.rows) {
+		const cells = rowCells(row);
+		const key = cellStr(cells[0]);
+		if (key !== "" && !keepSet.has(key)) {
+			toDelete.push(key);
+		}
+	}
+
+	if (toDelete.length === 0) return 0;
+
+	// Detach-delete each fact by key using MATCH (HydraDB doesn't support
+	// UNWIND with WHERE, so we delete one at a time — the list is small).
+	for (const key of toDelete) {
+		await client.query(
+			`MATCH (m:${NODE_LABELS.MEMORY_FACT} {key: $key}) DETACH DELETE m`,
+			{ key },
+			{ consistency: "strong" },
+		);
+	}
+
+	return toDelete.length;
+}
+
 export async function recordKnownDuplicate(
   client: HydraClient,
   proposedName: string,

@@ -17,7 +17,7 @@ import { getGraphStatus, getCallers, getCallees, getPathEvidence, MAX_HOPS } fro
 import { NODE_LABELS, REL_TYPES } from "./graph/schema.js";
 import { buildGraphSummary, renderAgentsMdSection, MARKER_START, MARKER_END } from "./graph/agentsSummary.js";
 import { checkDuplicateRisk, functionNameFromKey } from "./graph/duplicateCheck.js";
-import { recordKnownDuplicate, recordMemoryFactAbout, recallMemoryFacts, listMemoryFacts } from "./memory/store.js";
+import { recordKnownDuplicate, recordMemoryFactAbout, recallMemoryFacts, listMemoryFacts, cleanMemoryFacts } from "./memory/store.js";
 import { writeExtractedFiles } from "./graph/writer.js";
 import { parseSarif } from "./extract/sarifParser.js";
 import { writeFindings } from "./graph/sarifWriter.js";
@@ -53,7 +53,7 @@ ${pc.dim("───────────────────────�
 ${pc.bold("Command reference")}
 
 ${pc.bold("Indexing")}
-  ${pc.cyan("index [--path] [--watch] [--changed-only]")}    Index a codebase into HydraDB
+  ${pc.cyan("index [dir] [--watch] [--changed-only]")}    Index a codebase into HydraDB
   ${pc.cyan("status")}                                      Show graph counts
   ${pc.cyan("init-hooks")}                                  Install git post-commit hook
   ${pc.cyan("visualize [--output]")}                        Export graph as interactive HTML
@@ -70,6 +70,7 @@ ${pc.bold("Memory")}
   ${pc.cyan("memory record \"<text>\" [--about] [--supersedes]")}  Record a decision
   ${pc.cyan("memory recall [query] [--near] [--about]")}          Recall decisions
   ${pc.cyan("memory list [--all]")}                               Browse all facts
+  ${pc.cyan("memory clean --keep <keys...>")}                    Wipe all except listed keys
 
 ${pc.bold("Agents")}
   ${pc.cyan("mcp")}                                            Start MCP server on stdio
@@ -99,7 +100,8 @@ function collectPattern(value: string, previous: string[]): string[] {
 program
   .command("index")
   .description("Index the current codebase into HydraDB")
-  .option("--path <dir>", "directory to index (default: current directory)", ".")
+  .argument("[dir]", "directory to index (default: current directory)")
+  .option("--path <dir>", "directory to index (overrides positional)", ".")
   .option(
     "--pattern <glob>",
     "file glob to index (repeatable; default: **/*.{ts,tsx,js,jsx})",
@@ -109,8 +111,8 @@ program
   .option("--quiet", "suppress progress spinners")
   .option("--watch", "watch for changes and incrementally reindex")
   .option("--changed-only", "index only files changed in the most recent commit")
-  .action(async (opts: { path: string; pattern: string[]; quiet: boolean; watch?: boolean; changedOnly?: boolean }) => {
-    const repoRoot = path.resolve(opts.path);
+  .action(async (dir: string | undefined, opts: { path: string; pattern: string[]; quiet: boolean; watch?: boolean; changedOnly?: boolean }) => {
+    const repoRoot = path.resolve(dir ?? opts.path);
     const activePatterns = opts.pattern.length > 0 ? opts.pattern : [DEFAULT_INDEX_PATTERNS];
     const quiet = opts.quiet;
 
@@ -565,6 +567,45 @@ memoryCmd
             pc.dim(`  recorded ${dateStr} · trust ${f.trust.toFixed(1)}`),
           );
         }
+      }
+    } catch (err) {
+      if (err instanceof HydraConnectionError) {
+        console.error(pc.red(`\nerror: ${err.message}`));
+      } else if (err instanceof HydraQueryError) {
+        console.error(
+          pc.red(`\nerror: HydraDB rejected a query (HTTP ${err.status}): ${err.body}`),
+        );
+      } else {
+        console.error(pc.red(`\nerror: ${err instanceof Error ? err.message : String(err)}`));
+      }
+      process.exitCode = 1;
+    }
+  });
+
+memoryCmd
+  .command("clean")
+  .description("Delete all memory facts except those in a whitelist (useful for wiping test noise)")
+  .option("--keep <keys...>", "space-separated memory keys to keep (e.g. memory:abc123 memory:def456)", [] as string[])
+  .action(async (opts: { keep: string[] }) => {
+    try {
+      const config = loadConfig();
+      const client = new HydraClient(config);
+
+      console.log(pc.bold("hydracode memory clean"));
+      console.log();
+
+      if (opts.keep.length === 0) {
+        console.error(pc.red("error: --keep is required. Provide the memory keys to preserve, e.g.:"));
+        console.error(pc.dim("  hydracode memory clean --keep memory:abc123 memory:def456"));
+        process.exitCode = 1;
+        return;
+      }
+
+      const deleted = await cleanMemoryFacts(client, opts.keep);
+      if (deleted === 0) {
+        console.log(pc.green("no facts to delete -- all existing facts are in the keep list"));
+      } else {
+        console.log(pc.green(`deleted ${deleted} fact(s), kept ${opts.keep.length}`));
       }
     } catch (err) {
       if (err instanceof HydraConnectionError) {
