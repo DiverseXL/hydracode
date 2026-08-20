@@ -20,6 +20,7 @@
  */
 
 import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -681,7 +682,8 @@ server.tool(
 
 /**
  * Connect the McpServer to stdio and block until the connection closes.
- * Called by the CLI's `mcp` command action; nothing else should call this.
+ * Called by the CLI's `mcp` command action or self-started when this
+ * file is the entry point (e.g. `npx tsx src/mcp/server.ts`).
  *
  * CRITICAL: after this returns the process will exit. Do not call any
  * function that writes to stdout before or after this — the MCP transport
@@ -691,4 +693,22 @@ export async function startMcpServer(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // server.connect() blocks until the transport closes (client disconnects).
+}
+
+/* ------------------------------------------------------------------ */
+/* Direct execution — npx tsx src/mcp/server.ts                        */
+/* ------------------------------------------------------------------ */
+
+// ESM equivalent of require.main === module: only fire when this file
+// is the entry point, not when imported by cli.ts or tests.
+const __selfUrl = import.meta.url;
+const __entryUrl = process.argv[1]
+  ? pathToFileURL(process.argv[1]).href
+  : undefined;
+
+if (__entryUrl && __selfUrl === __entryUrl) {
+  startMcpServer().catch((err) => {
+    console.error("[hydracode-mcp] fatal:", err);
+    process.exit(1);
+  });
 }
