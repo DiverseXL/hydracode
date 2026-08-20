@@ -21,7 +21,7 @@ hydracode fixes this by giving agents a real, queryable graph instead of a vecto
 | Capability | Command | What makes it different |
 |---|---|---|
 | Index a codebase into a graph | `hydracode index` | Functions, classes, files, imports, and call relationships — written as real nodes and edges in HydraDB, not chunks in a vector store |
-| Ask structural questions | `hydracode ask "who calls X"` | Returns actual call-path **evidence** (`[fn] -[:CALLS]-> [fn]`), not just a list — a provable relationship, not a similarity score |
+| Ask structural questions | `hydracode ask "who calls X"` | Returns call-chain **evidence** + related memory facts + security findings in one response — a provable relationship, not a similarity score |
 | Catch duplicate logic before it's written | `hydracode check-duplicate "newFunctionName"` | Flags existing functions with similar names/purpose *before* an agent writes a redundant one — and can record *why* a near-duplicate was intentional, so it's never re-flagged |
 | Remember project decisions | `hydracode memory record` / `memory recall` | Persists decisions and conventions in the graph, linked to the actual code they concern |
 | Keep AGENTS.md honest | `hydracode sync-agents-md` | Auto-generates a graph-derived section of AGENTS.md (high fan-in functions, most-connected files, honest test-coverage status) — kept in sync with the real codebase instead of hand-written and stale |
@@ -184,13 +184,26 @@ Exports the full indexed code graph as an interactive, self-contained HTML file 
 
 ---
 
+## Security findings (SARIF import)
+
+```bash
+node dist/cli.js import-sarif ./results.sarif
+# or via any SARIF-compatible scanner:
+# codeql database analyze --format=sarif-latest --output=results.sarif
+# npx eslint src/ --format @microsoft/eslint-formatter-sarif
+```
+
+Ingests security findings from any SARIF 2.1.0-compatible scanner (CodeQL, ESLint SARIF formatter, Semgrep, etc.) as `SecurityFinding` nodes in the graph. Each finding is linked via `AFFECTS` edges to the `Function` node whose line range contains it, and always to the `File` node as a fallback. This makes `impact` queries include vulnerability context — "what's the blast radius of this vulnerability" is the same graph traversal as "what's the blast radius of changing this function." A finding's transitive reach through `CALLS` edges is a reachability problem — not answerable by a vector store.
+
+---
+
 ## Command reference
 
 | Command | Description |
 |---|---|
 | `hydracode index [--path <dir>] [--watch] [--changed-only]` | Index (or re-index) a codebase. `--watch` runs a live file watcher with debounced incremental reindexing. `--changed-only` indexes just the files touched in the last git commit. |
 | `hydracode visualize [--output <path>]` | Export the indexed code graph as an interactive, self-contained HTML page with a D3.js force-directed visualization. Default output: `hydracode-graph.html`. |
-| `hydracode ask "<question>" [--max-hops <n>]` | Ask a structural question; returns results plus path evidence where available. |
+| `hydracode ask "<question>" [--max-hops <n>]` | Ask a structural question; returns call-chain structure + related memory facts + security findings in one response. |
 | `hydracode status` | Show whether the current graph is indexed, and basic counts (files/functions/classes/tests). |
 | `hydracode check-duplicate "<name>" [--file <path>] [--record "<reason>"]` | Check whether a proposed function name/purpose likely already exists. `--record` persists a deliberate-duplicate decision so future checks don't re-flag it. |
 | `hydracode memory record "<text>" [--about <name>] [--supersedes <key>]` | Record a project decision or convention, optionally linked to a specific function/class/file. `--supersedes` marks an older fact as replaced (SUPERSEDED_BY edge) so stale decisions never win over current ones. |
@@ -198,6 +211,10 @@ Exports the full indexed code graph as an interactive, self-contained HTML file 
 | `hydracode memory list [--all]` | Browse all active memory facts. `--all` includes superseded facts to see the full decision history. |
 | `hydracode sync-agents-md` | Generate or update the auto-generated section of `AGENTS.md` from the live graph. Preserves any hand-written content outside the markers. |
 | `hydracode init-hooks` | Install a git `post-commit` hook that automatically reindexes changed files after every commit. |
+| `hydracode callers <symbol> [--max-hops <n>]` | Find all functions that call a given function (transitive). Default 3 hops. |
+| `hydracode callees <symbol> [--max-hops <n>]` | Find all functions that a given function calls (transitive). Default 3 hops. |
+| `hydracode impact <symbol> [--max-hops <n>]` | Full blast radius: callers + callees + call-chain paths as evidence. |
+| `hydracode import-sarif <file> [--tool <name>]` | Import SARIF security findings into the code graph as SecurityFinding nodes. |
 | `hydracode mcp` | Start the MCP server on stdio — this is what an MCP client launches as a subprocess. |
 | `hydracode install` | Auto-write MCP configuration for Cursor and Claude Code. |
 
@@ -209,6 +226,10 @@ Exports the full indexed code graph as an interactive, self-contained HTML file 
 | `hydracode_index` | `index` | Always runs quiet (no stdout pollution — required for a clean MCP stdio stream) |
 | `hydracode_ask` | `ask` | Returns structured JSON, not colored terminal text |
 | `hydracode_check_duplicate` | `check-duplicate` | Description is written to invite agents to call it *before* writing new code |
+| `hydracode_callers` | `callers` | `{ symbol, maxHops? }` — typed callers list with file locations |
+| `hydracode_callees` | `callees` | `{ symbol, maxHops? }` — typed callees list with file locations |
+| `hydracode_impact` | `impact` | `{ symbol, maxHops? }` — callers + callees + call-chain path evidence |
+| `hydracode_import_sarif` | `import-sarif` | `{ content: string, tool? }` — ingest raw SARIF JSON, returns `SarifWriteSummary` |
 | `hydracode_record_decision` | `memory record` | Accepts `about` and `supersedesKey` — mark old decisions as replaced so they're filtered from recall |
 | `hydracode_recall_memory` | `memory recall` | Accepts `nearNode` for proximity retrieval — facts about a node's call/file neighborhood, not just text matches |
 | `hydracode_list_memory` | `memory list` | Browse all active facts; `includeSuperseded` option shows full decision history |
@@ -276,6 +297,16 @@ HydraDB isn't incidental — it's the storage and query engine for the entire pr
 All of the above were verified against HydraDB's live source and a running instance — not assumed from documentation, since several of them (integer-only ids, relationship-type-required-in-MERGE, no grouped-aggregation-by-default-assumption) are not what a Neo4j-familiar developer would expect by default.
 
 - **The memory layer stores `MemoryFact` nodes with `ABOUT` edges** linking decisions to the specific `Function`, `ClassEntity`, or `File` nodes they concern. `SUPERSEDED_BY` edges connect old decisions to the facts that replace them, making fact currency unambiguous — the node's `status` field is the authoritative signal, not edge traversal. **Proximity recall** traverses `CALLS` and `CONTAINS` edges from an anchor node to find all neighboring node ids, then fetches `MemoryFact` nodes with `ABOUT` edges pointing at any of those ids — a query that is structurally impossible for a flat memory store.
+- **`SecurityFinding` nodes with `AFFECTS` edges to `Function` and `File` nodes** enable "which functions in my call chain have known vulnerabilities" as a native graph traversal. The same `CALLS`-chain traversal that powers `impact` queries also surfaces security context — a finding's transitive reach is a graph reachability problem, not a text-match problem.
+
+### What breaks without HydraDB
+
+- **Multi-hop call chains:** variable-length `MATCH (*1..3)` is a native graph traversal — not reproducible with SQLite or vectors without writing your own BFS
+- **Path evidence:** `algo.SSpaths` returns the actual node/edge sequence — not just endpoints
+- **Memory linked to code:** `MemoryFact -[:ABOUT]-> Function` connects decisions to the exact nodes they concern, queryable alongside the code graph in the same store
+- **Security in context:** `SecurityFinding -[:AFFECTS]-> Function` means vulnerability blast radius is the same query as change blast radius
+- **Proximity recall:** traversing `CALLS` + `CONTAINS` to find neighboring memory facts is a graph query — a flat store has no equivalent
+- **Idempotent re-indexing:** `UNWIND $rows AS row MERGE` is a single atomic batch — not a read-modify-write cycle
 
 ---
 
@@ -291,6 +322,8 @@ Being upfront about these rather than hiding them:
 - **Multi-type variable-length patterns are rejected.** Writing `MATCH (a)-[:CALLS|CONTAINS*1..3]->(b)` fails — HydraDB requires exactly one relationship type per variable-length pattern. The workaround is two separate queries with different types, merged in JS.
 - **Variable-length `*0..N` minimum-hop is not supported.** The minimum is `*1..N` — a 0-hop self-inclusion (e.g. `CALLS*0..1` to also return the anchor node) is rejected. When the anchor itself needs to be in the result set, it must be added explicitly.
 - **`UNWIND MATCH` does not support `WHERE`.** The error is `"UNWIND MATCH does not support OPTIONAL, hints, or WHERE"` — so `UNWIND $ids AS nid MATCH (m)-[:ABOUT]->({id: nid}) WHERE m.status = 'active'` fails. The workaround is to fetch all active facts and filter in JS, which is efficient given the memory graph's small size.
+- **SARIF findings are matched to `Function` nodes by line-range containment** (`finding.startLine` within `function.startLine..endLine`) — findings outside any indexed function's range are linked to the `File` node only.
+- **SARIF results with no `physicalLocation` are skipped** (some tools emit location-free findings).
 - **The git post-commit hook runs synchronously on Windows/Git Bash** (a background-subshell quirk observed during development), typically completing in well under a second for incremental reindexes — negligible in practice, but worth knowing if you're extending it.
 
 ---
@@ -338,6 +371,21 @@ docker/
 scripts/
   smoke-test.ts, index-self.ts, ...          Verification scripts used during development
 ```
+
+---
+
+## Roadmap
+
+These are the natural next steps — not built yet, but the graph schema and MCP surface are designed to extend cleanly:
+
+- **npm publish** — `package.json` is already configured with `bin: { hydracode }`, ready to publish once the Docker setup UX is tighter
+- **SARIF CI integration** — run `hydracode import-sarif` as a post-scan step in GitHub Actions to keep the security graph current alongside the code graph
+- **VS Code sidebar extension** — the MCP server's structured output is designed to be consumed by an IDE extension; a sidebar showing call-graph context around the current file is the natural next surface
+- **Shared remote HydraDB** — TLS + read tokens for team-shared graph (config already supports `https://` URIs and non-plaintext mode)
+- **SUPERSEDES/CONTRADICTS on memory facts** — full temporal truth tracking for decisions, not just supersede-on-record
+- **SARIF import from MCP** — already built as `hydracode_import_sarif`; CI pipeline integration coming
+- **Change-set mode** — given a git diff, list impacted symbols from the graph without re-indexing everything
+- **Test coverage edges** — link `Test` nodes to the `Function`s they cover (currently extracted but not linked)
 
 ---
 
