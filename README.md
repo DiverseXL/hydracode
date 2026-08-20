@@ -318,7 +318,7 @@ Being upfront about these rather than hiding them:
 - **Path evidence is anchor-outward only.** `algo.SSpaths` returns paths *from* the resolved node outward, so asking "who calls X" gives you the caller list but not path evidence for the callers themselves — only for what the anchor node calls onward.
 - **Test coverage linking isn't implemented yet.** Test nodes are extracted, but nothing currently links a test to the code it covers, so `sync-agents-md`'s test-coverage section is honest about this rather than reporting a misleading "0 untested functions."
 - **File deletion isn't reconciled.** If a file is removed from disk, its previously-indexed nodes remain in the graph until a full re-index or manual cleanup — the GC pass only cleans up stale versions *within* files that were actually re-indexed in a given run.
-- **Full memory/contradiction tracking (Track 03's `SUPERSEDED_BY`/`CONTRADICTS`) is out of scope for this submission.** The memory layer that exists (`MemoryFact` + `ABOUT` edges) is deliberately scoped to what the duplicate-check feature needed — a fuller temporal/trust-propagation memory graph is a natural extension, not something built here.
+- **`CONTRADICTS` edges are defined in the schema but not yet wired into the memory layer.** `SUPERSEDED_BY` is fully implemented (explicit replacement). The symmetric conflict detection (`CONTRADICTS` — two facts about the same node that disagree) is a natural extension, not built yet.
 - **Multi-type variable-length patterns are rejected.** Writing `MATCH (a)-[:CALLS|CONTAINS*1..3]->(b)` fails — HydraDB requires exactly one relationship type per variable-length pattern. The workaround is two separate queries with different types, merged in JS.
 - **Variable-length `*0..N` minimum-hop is not supported.** The minimum is `*1..N` — a 0-hop self-inclusion (e.g. `CALLS*0..1` to also return the anchor node) is rejected. When the anchor itself needs to be in the result set, it must be added explicitly.
 - **`UNWIND MATCH` does not support `WHERE`.** The error is `"UNWIND MATCH does not support OPTIONAL, hints, or WHERE"` — so `UNWIND $ids AS nid MATCH (m)-[:ABOUT]->({id: nid}) WHERE m.status = 'active'` fails. The workaround is to fetch all active facts and filter in JS, which is efficient given the memory graph's small size.
@@ -382,7 +382,7 @@ These are the natural next steps — not built yet, but the graph schema and MCP
 - **SARIF CI integration** — run `hydracode import-sarif` as a post-scan step in GitHub Actions to keep the security graph current alongside the code graph
 - **VS Code sidebar extension** — the MCP server's structured output is designed to be consumed by an IDE extension; a sidebar showing call-graph context around the current file is the natural next surface
 - **Shared remote HydraDB** — TLS + read tokens for team-shared graph (config already supports `https://` URIs and non-plaintext mode)
-- **SUPERSEDES/CONTRADICTS on memory facts** — full temporal truth tracking for decisions, not just supersede-on-record
+- **`CONTRADICTS` edges on memory facts** — symmetric conflict detection (two facts about the same node that disagree), complementing the existing `SUPERSEDED_BY` explicit replacement
 - **SARIF import from MCP** — already built as `hydracode_import_sarif`; CI pipeline integration coming
 - **Change-set mode** — given a git diff, list impacted symbols from the graph without re-indexing everything
 - **Test coverage edges** — link `Test` nodes to the `Function`s they cover (currently extracted but not linked)
