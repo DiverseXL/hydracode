@@ -452,7 +452,7 @@ These are the natural next steps — not built yet, but the graph schema and MCP
 
 ## License
 
-AGPL-3.0-or-later — matching HydraDB's own license, since this project depends on it as a core component.
+MIT
 
 ---
 
