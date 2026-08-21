@@ -10,7 +10,7 @@
 |---|---|
 | **Primary track** | 02B — Repos, Dependencies & Code as Graphs |
 | **Secondary track** | 03 — Memory & Context Retrieval (memory facts + `SUPERSEDED_BY` + deliberate-duplicate recording) |
-| **Demo video** | <!-- DEMO: add URL --> |
+| **Demo video** | [Watch the demo on Vimeo](https://vimeo.com/1219823839?share=copy&fl=sv&fe=ci) |
 
 **What judges should look at in the 3-minute video:**
 

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "hydracode": {
+      "command": "node",
+      "args": [
+        "C:\\Users\\MY PC\\Documents\\hydracode\\dist\\cli.js",
+        "mcp"
+      ],
+      "type": "stdio"
+    }
+  }
+}
